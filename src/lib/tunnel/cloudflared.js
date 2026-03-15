@@ -217,10 +217,12 @@ export function killCloudflared() {
     clearPid();
   }
 
-  // Kill any remaining cloudflared processes
-  try {
-    execSync("pkill -f cloudflared 2>/dev/null || true", { stdio: "ignore" });
-  } catch (e) { /* ignore */ }
+  // Chỉ dùng pkill ở Unix; Windows đã có process.kill/taskkill ở trên.
+  if (!IS_WINDOWS) {
+    try {
+      execSync("pkill -f cloudflared 2>/dev/null || true", { stdio: "ignore" });
+    } catch (e) { /* ignore */ }
+  }
 }
 
 export function isCloudflaredRunning() {

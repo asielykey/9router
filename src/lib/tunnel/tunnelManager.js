@@ -11,7 +11,10 @@ const SHORT_ID_CHARS = "abcdefghijklmnpqrstuvwxyz23456789";
 const RECONNECT_DELAYS_MS = [5000, 10000, 20000, 30000, 60000];
 const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
 
-let isReconnecting = false;
+const tunnelRuntime = global.__tunnelRuntime ??= {
+  enablePromise: null,
+  isReconnecting: false,
+};
 
 function generateShortId() {
   let result = "";
@@ -51,50 +54,62 @@ async function workerFetch(reqPath, options = {}) {
 }
 
 export async function enableTunnel() {
-  const existing = loadState();
-  if (existing && existing.tunnelUrl && isCloudflaredRunning()) {
-    return { success: true, tunnelUrl: existing.tunnelUrl, shortId: existing.shortId, alreadyRunning: true };
+  if (tunnelRuntime.enablePromise) {
+    return tunnelRuntime.enablePromise;
   }
 
-  killCloudflared();
+  tunnelRuntime.enablePromise = (async () => {
+    const existing = loadState();
+    if (existing && existing.tunnelUrl && isCloudflaredRunning()) {
+      return { success: true, tunnelUrl: existing.tunnelUrl, shortId: existing.shortId, alreadyRunning: true };
+    }
 
-  const machineId = getMachineId();
-  const shortId = existing?.shortId || generateShortId();
-  const apiKey = existing?.apiKey || generateApiKey(machineId);
+    killCloudflared();
 
-  await workerFetch("/api/session/create", {
-    method: "POST",
-    body: JSON.stringify({ apiKey, shortId })
-  });
+    const machineId = getMachineId();
+    const shortId = existing?.shortId || generateShortId();
+    const apiKey = existing?.apiKey || generateApiKey(machineId);
 
-  const tunnelResult = await workerFetch("/api/tunnel/create", {
-    method: "POST",
-    body: JSON.stringify({ apiKey })
-  });
+    await workerFetch("/api/session/create", {
+      method: "POST",
+      body: JSON.stringify({ apiKey, shortId })
+    });
 
-  if (tunnelResult.error) {
-    throw new Error(tunnelResult.error);
+    const tunnelResult = await workerFetch("/api/tunnel/create", {
+      method: "POST",
+      body: JSON.stringify({ apiKey })
+    });
+
+    if (tunnelResult.error) {
+      throw new Error(tunnelResult.error);
+    }
+
+    const { token, hostname } = tunnelResult;
+
+    await spawnCloudflared(token);
+
+    saveState({ shortId, apiKey, tunnelUrl: hostname, machineId });
+
+    await updateSettings({ tunnelEnabled: true, tunnelUrl: hostname });
+
+    // Chặn các luồng reconnect khác nhau gọi enable cùng lúc.
+    setUnexpectedExitHandler(() => {
+      if (!tunnelRuntime.isReconnecting) scheduleReconnect(0);
+    });
+
+    return { success: true, tunnelUrl: hostname, shortId };
+  })();
+
+  try {
+    return await tunnelRuntime.enablePromise;
+  } finally {
+    tunnelRuntime.enablePromise = null;
   }
-
-  const { token, hostname } = tunnelResult;
-
-  await spawnCloudflared(token);
-
-  saveState({ shortId, apiKey, tunnelUrl: hostname, machineId });
-
-  await updateSettings({ tunnelEnabled: true, tunnelUrl: hostname });
-
-  // Re-register exit handler each time tunnel starts (handles reconnect scenario too)
-  setUnexpectedExitHandler(() => {
-    if (!isReconnecting) scheduleReconnect(0);
-  });
-
-  return { success: true, tunnelUrl: hostname, shortId };
 }
 
 async function scheduleReconnect(attempt) {
-  if (isReconnecting) return;
-  isReconnecting = true;
+  if (tunnelRuntime.isReconnecting) return;
+  tunnelRuntime.isReconnecting = true;
 
   const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
   console.log(`[Tunnel] Unexpected exit detected, reconnecting in ${delay / 1000}s (attempt ${attempt + 1})...`);
@@ -105,15 +120,15 @@ async function scheduleReconnect(attempt) {
     const settings = await getSettings();
     if (!settings.tunnelEnabled) {
       console.log("[Tunnel] Tunnel disabled, skipping reconnect");
-      isReconnecting = false;
+      tunnelRuntime.isReconnecting = false;
       return;
     }
     await enableTunnel();
     console.log("[Tunnel] Reconnected successfully");
-    isReconnecting = false;
+    tunnelRuntime.isReconnecting = false;
   } catch (err) {
     console.log(`[Tunnel] Reconnect attempt ${attempt + 1} failed:`, err.message);
-    isReconnecting = false;
+    tunnelRuntime.isReconnecting = false;
     const nextAttempt = attempt + 1;
     if (nextAttempt < MAX_RECONNECT_ATTEMPTS) {
       scheduleReconnect(nextAttempt);

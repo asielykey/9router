@@ -35,6 +35,8 @@ process.setMaxListeners(20);
 
 // Use global to survive Next.js hot reload — prevents duplicate intervals
 const g = global.__appSingleton ??= {
+  initialized: false,
+  initPromise: null,
   signalHandlersRegistered: false,
   watchdogInterval: null,
   networkMonitorInterval: null,
@@ -56,46 +58,57 @@ const NETWORK_RESTART_COOLDOWN_MS = 30000;
  * - Start watchdog to recover tunnel after sleep/wake
  */
 export async function initializeApp() {
-  try {
-    await cleanupProviderConnections();
+  if (g.initialized) return;
+  if (g.initPromise) return g.initPromise;
 
-    // Auto-reconnect tunnel if it was enabled before restart
-    const settings = await getSettings();
-    if (settings.tunnelEnabled && !isCloudflaredRunning()) {
-      console.log("[InitApp] Tunnel was enabled, auto-reconnecting...");
-      try {
-        await enableTunnel();
-        console.log("[InitApp] Tunnel reconnected");
-      } catch (error) {
-        console.log("[InitApp] Tunnel reconnect failed:", error.message);
+  g.initPromise = (async () => {
+    try {
+      await cleanupProviderConnections();
+
+      // Auto-reconnect tunnel if it was enabled before restart
+      const settings = await getSettings();
+      if (settings.tunnelEnabled && !isCloudflaredRunning()) {
+        console.log("[InitApp] Tunnel was enabled, auto-reconnecting...");
+        try {
+          await enableTunnel();
+          console.log("[InitApp] Tunnel reconnected");
+        } catch (error) {
+          console.log("[InitApp] Tunnel reconnect failed:", error.message);
+        }
       }
+
+      // Kill cloudflared on process exit (register once only)
+      if (!g.signalHandlersRegistered) {
+        const cleanup = () => {
+          killCloudflared();
+          process.exit();
+        };
+        process.on("SIGINT", cleanup);
+        process.on("SIGTERM", cleanup);
+        g.signalHandlersRegistered = true;
+      }
+
+      // Pre-download cloudflared binary in background
+      ensureCloudflared().catch(() => {});
+
+      // Watchdog: recover tunnel after process crash
+      startWatchdog();
+
+      // Network monitor: detect sleep/wake + network changes → restart tunnel
+      startNetworkMonitor();
+
+      // Auto-start MITM if it was enabled before restart
+      autoStartMitm();
+
+      g.initialized = true;
+    } catch (error) {
+      console.error("[InitApp] Error:", error);
+    } finally {
+      g.initPromise = null;
     }
+  })();
 
-    // Kill cloudflared on process exit (register once only)
-    if (!g.signalHandlersRegistered) {
-      const cleanup = () => {
-        killCloudflared();
-        process.exit();
-      };
-      process.on("SIGINT", cleanup);
-      process.on("SIGTERM", cleanup);
-      g.signalHandlersRegistered = true;
-    }
-
-    // Pre-download cloudflared binary in background
-    ensureCloudflared().catch(() => {});
-
-    // Watchdog: recover tunnel after process crash
-    startWatchdog();
-
-    // Network monitor: detect sleep/wake + network changes → restart tunnel
-    startNetworkMonitor();
-
-    // Auto-start MITM if it was enabled before restart
-    autoStartMitm();
-  } catch (error) {
-    console.error("[InitApp] Error:", error);
-  }
+  return g.initPromise;
 }
 
 /** Auto-start MITM if it was enabled before restart */
