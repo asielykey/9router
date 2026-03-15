@@ -2,6 +2,7 @@
 param(
   [string]$ProjectRoot = (Join-Path $PSScriptRoot ".."),
   [string]$OutputRoot,
+  [string]$RuntimeDir,
   [string]$NodeExePath,
   [string]$InnoSetupCompilerPath,
   [int]$Port = 20128,
@@ -53,6 +54,33 @@ function Reset-Directory {
   New-Item -ItemType Directory -Path $PathValue -Force | Out-Null
 }
 
+function New-ZipArchive {
+  param(
+    [string]$SourceDir,
+    [string]$DestinationPath
+  )
+
+  $tarCommand = Get-Command tar -ErrorAction SilentlyContinue
+  if ($tarCommand) {
+    Write-Step "Dang nen portable bang tar.exe..."
+    Push-Location $SourceDir
+    try {
+      & $tarCommand.Source -a -cf $DestinationPath .
+      if ($LASTEXITCODE -ne 0) {
+        throw "Lenh tar that bai voi ma $LASTEXITCODE."
+      }
+
+      return
+    }
+    finally {
+      Pop-Location
+    }
+  }
+
+  Write-Step "Dang nen portable bang Compress-Archive..."
+  Compress-Archive -Path (Join-Path $SourceDir "*") -DestinationPath $DestinationPath -Force
+}
+
 function Copy-DirectoryContents {
   param(
     [string]$SourceDir,
@@ -88,20 +116,63 @@ function Get-InnoSetupCompiler {
   return $null
 }
 
+function Restore-EnvironmentValue {
+  param(
+    [string]$Name,
+    [AllowNull()][string]$Value
+  )
+
+  if ($null -eq $Value) {
+    Remove-Item -Path ("Env:{0}" -f $Name) -ErrorAction SilentlyContinue
+    return
+  }
+
+  Set-Item -Path ("Env:{0}" -f $Name) -Value $Value
+}
+
 function Invoke-NextStandaloneBuild {
   param([string]$RootDir)
+
+  $nextCliPath = Join-Path $RootDir "node_modules\next\dist\bin\next"
+  if (-not (Test-Path -LiteralPath $nextCliPath)) {
+    throw "Khong tim thay Next local trong '$nextCliPath'. Hay chay 'npm install' tai repo truoc khi build source."
+  }
+
+  $fakeHomeRoot = Join-Path $RootDir ".fakehome"
+  $fakeAppData = Join-Path $fakeHomeRoot "AppData\Roaming"
+  $fakeLocalAppData = Join-Path $fakeHomeRoot "AppData\Local"
+  Ensure-Directory -PathValue $fakeHomeRoot
+  Ensure-Directory -PathValue $fakeAppData
+  Ensure-Directory -PathValue $fakeLocalAppData
+
+  $previousHome = $env:HOME
+  $previousUserProfile = $env:USERPROFILE
+  $previousAppData = $env:APPDATA
+  $previousLocalAppData = $env:LOCALAPPDATA
+  $previousNodeEnv = $env:NODE_ENV
+  $previousNextTelemetryDisabled = $env:NEXT_TELEMETRY_DISABLED
 
   Write-Step "Dang build Next standalone..."
   Push-Location $RootDir
   try {
+    $env:HOME = $fakeHomeRoot
+    $env:USERPROFILE = $fakeHomeRoot
+    $env:APPDATA = $fakeAppData
+    $env:LOCALAPPDATA = $fakeLocalAppData
     $env:NODE_ENV = "production"
     $env:NEXT_TELEMETRY_DISABLED = "1"
-    & npx next build --webpack
+    & node $nextCliPath build --webpack
     if ($LASTEXITCODE -ne 0) {
       throw "Lenh build Next standalone that bai voi ma $LASTEXITCODE."
     }
   }
   finally {
+    Restore-EnvironmentValue -Name "HOME" -Value $previousHome
+    Restore-EnvironmentValue -Name "USERPROFILE" -Value $previousUserProfile
+    Restore-EnvironmentValue -Name "APPDATA" -Value $previousAppData
+    Restore-EnvironmentValue -Name "LOCALAPPDATA" -Value $previousLocalAppData
+    Restore-EnvironmentValue -Name "NODE_ENV" -Value $previousNodeEnv
+    Restore-EnvironmentValue -Name "NEXT_TELEMETRY_DISABLED" -Value $previousNextTelemetryDisabled
     Pop-Location
   }
 }
@@ -114,6 +185,7 @@ if (-not $OutputRoot) {
 $resolvedOutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $packageJsonPath = Join-Path $resolvedProjectRoot "package.json"
 $installerScriptPath = Join-Path $resolvedProjectRoot "installer\windows\9router.iss"
+$resolvedRuntimeDir = $null
 $standaloneRoot = Join-Path $resolvedProjectRoot ".next\standalone"
 $standaloneServerPath = Join-Path $standaloneRoot "server.js"
 $staticRoot = Join-Path $resolvedProjectRoot ".next\static"
@@ -146,15 +218,21 @@ if (-not $NodeExePath) {
 $resolvedNodeExePath = Resolve-AbsolutePath -PathValue $NodeExePath
 Ensure-PathExists -PathValue $resolvedNodeExePath -Label "node.exe"
 
-if (-not $SkipBuild) {
+if ($RuntimeDir) {
+  $resolvedRuntimeDir = Resolve-AbsolutePath -PathValue $RuntimeDir
+  Ensure-PathExists -PathValue $resolvedRuntimeDir -Label "runtime dir"
+  Ensure-PathExists -PathValue (Join-Path $resolvedRuntimeDir "server.js") -Label "runtime server.js"
+} elseif (-not $SkipBuild) {
   Invoke-NextStandaloneBuild -RootDir $resolvedProjectRoot
 }
 
-Ensure-PathExists -PathValue $standaloneServerPath -Label "server.js cua Next standalone"
-Ensure-PathExists -PathValue $staticRoot -Label ".next\\static"
-Ensure-PathExists -PathValue $publicRoot -Label "public"
-Ensure-PathExists -PathValue $openSseRoot -Label "open-sse"
-Ensure-PathExists -PathValue $srcRoot -Label "src"
+if (-not $resolvedRuntimeDir) {
+  Ensure-PathExists -PathValue $standaloneServerPath -Label "server.js cua Next standalone"
+  Ensure-PathExists -PathValue $staticRoot -Label ".next\\static"
+  Ensure-PathExists -PathValue $publicRoot -Label "public"
+  Ensure-PathExists -PathValue $openSseRoot -Label "open-sse"
+  Ensure-PathExists -PathValue $srcRoot -Label "src"
+}
 Ensure-PathExists -PathValue $iconSourcePath -Label "favicon.ico"
 
 Write-Step "Dang dung thu muc runtime Windows..."
@@ -162,11 +240,15 @@ Reset-Directory -PathValue $stagingRoot
 Ensure-Directory -PathValue $appRoot
 Ensure-Directory -PathValue $artifactsRoot
 
-Copy-DirectoryContents -SourceDir $standaloneRoot -DestinationDir $appRoot
-Copy-DirectoryContents -SourceDir $staticRoot -DestinationDir (Join-Path $appRoot ".next\static")
-Copy-DirectoryContents -SourceDir $publicRoot -DestinationDir (Join-Path $appRoot "public")
-Copy-DirectoryContents -SourceDir $openSseRoot -DestinationDir (Join-Path $appRoot "open-sse")
-Copy-DirectoryContents -SourceDir $srcRoot -DestinationDir (Join-Path $appRoot "src")
+if ($resolvedRuntimeDir) {
+  Copy-DirectoryContents -SourceDir $resolvedRuntimeDir -DestinationDir $appRoot
+} else {
+  Copy-DirectoryContents -SourceDir $standaloneRoot -DestinationDir $appRoot
+  Copy-DirectoryContents -SourceDir $staticRoot -DestinationDir (Join-Path $appRoot ".next\static")
+  Copy-DirectoryContents -SourceDir $publicRoot -DestinationDir (Join-Path $appRoot "public")
+  Copy-DirectoryContents -SourceDir $openSseRoot -DestinationDir (Join-Path $appRoot "open-sse")
+  Copy-DirectoryContents -SourceDir $srcRoot -DestinationDir (Join-Path $appRoot "src")
+}
 
 Copy-Item -LiteralPath $resolvedNodeExePath -Destination (Join-Path $appRoot "node.exe") -Force
 Copy-Item -LiteralPath $iconSourcePath -Destination (Join-Path $stagingRoot "9router.ico") -Force
@@ -181,18 +263,10 @@ $manifest = [ordered]@{
   builtAt = (Get-Date).ToString("s")
   nodeExe = [System.IO.Path]::GetFileName($resolvedNodeExePath)
   nodeSource = $resolvedNodeExePath
+  runtimeSource = if ($resolvedRuntimeDir) { $resolvedRuntimeDir } else { $standaloneRoot }
 }
 
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stagingRoot "build-manifest.json") -Encoding UTF8
-
-if (-not $SkipZip) {
-  Write-Step "Dang tao goi portable zip..."
-  if (Test-Path -LiteralPath $zipOutputPath) {
-    Remove-Item -LiteralPath $zipOutputPath -Force
-  }
-
-  Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $zipOutputPath -Force
-}
 
 if (-not $SkipInstaller) {
   $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoSetupCompilerPath
@@ -213,6 +287,15 @@ if (-not $SkipInstaller) {
   if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup build that bai voi ma $LASTEXITCODE."
   }
+}
+
+if (-not $SkipZip) {
+  Write-Step "Dang tao goi portable zip..."
+  if (Test-Path -LiteralPath $zipOutputPath) {
+    Remove-Item -LiteralPath $zipOutputPath -Force
+  }
+
+  New-ZipArchive -SourceDir $stagingRoot -DestinationPath $zipOutputPath
 }
 
 Write-Step "Hoan tat."
