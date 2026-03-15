@@ -114,10 +114,15 @@ export async function ensureCloudflared() {
 
 let cloudflaredProcess = null;
 let unexpectedExitHandler = null;
+const cloudflaredState = global.__cloudflaredState ??= {
+  process: null,
+  unexpectedExitHandler: null,
+};
 
 /** Register a callback to be called when cloudflared exits unexpectedly after connecting */
 export function setUnexpectedExitHandler(handler) {
   unexpectedExitHandler = handler;
+  cloudflaredState.unexpectedExitHandler = handler;
 }
 
 export async function spawnCloudflared(tunnelToken) {
@@ -125,10 +130,12 @@ export async function spawnCloudflared(tunnelToken) {
 
   const child = spawn(binaryPath, ["tunnel", "run", "--dns-resolver-addrs", "1.1.1.1:53", "--token", tunnelToken], {
     detached: false,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: IS_WINDOWS
   });
 
   cloudflaredProcess = child;
+  cloudflaredState.process = child;
   savePid(child.pid);
 
   return new Promise((resolve, reject) => {
@@ -166,6 +173,7 @@ export async function spawnCloudflared(tunnelToken) {
 
     child.on("exit", (code) => {
       cloudflaredProcess = null;
+      cloudflaredState.process = null;
       clearPid();
       const wasConnected = resolved; // true = already connected successfully
       if (!resolved) {
@@ -177,26 +185,35 @@ export async function spawnCloudflared(tunnelToken) {
         }
       }
       // Only notify on unexpected exit AFTER successful connection
-      if (wasConnected && unexpectedExitHandler) {
-        unexpectedExitHandler();
+      const handler = cloudflaredState.unexpectedExitHandler || unexpectedExitHandler;
+      if (wasConnected && handler) {
+        handler();
       }
     });
   });
 }
 
 export function killCloudflared() {
-  if (cloudflaredProcess) {
+  const activeProcess = cloudflaredState.process || cloudflaredProcess;
+  if (activeProcess) {
     try {
-      cloudflaredProcess.kill();
+      activeProcess.kill();
     } catch (e) { /* ignore */ }
     cloudflaredProcess = null;
+    cloudflaredState.process = null;
   }
 
   const pid = loadPid();
   if (pid) {
     try {
       process.kill(pid);
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      if (IS_WINDOWS) {
+        try {
+          execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
+        } catch { /* ignore */ }
+      }
+    }
     clearPid();
   }
 
