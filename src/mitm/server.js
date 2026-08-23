@@ -1,117 +1,90 @@
 const https = require("https");
+const http2 = require("http2");
+const tls = require("tls");
 const fs = require("fs");
 const path = require("path");
 const dns = require("dns");
 const { promisify } = require("util");
-const { log, err } = require("./logger");
+const { execSync } = require("child_process");
+const { log, err, dumpRequest, createResponseDumper, clearDumpDir } = require("./logger");
+const { IS_DEV, LSOF_BIN, TARGET_HOSTS, URL_PATTERNS, MODEL_SYNONYMS, MODEL_PATTERNS, MODEL_NO_MAP, getToolForHost, isChatRequest, extractModel } = require("./config");
+const { DATA_DIR, MITM_DIR } = require("./paths");
+const { generateCert, getCertForDomain } = require("./cert/generate");
+const { getMitmAlias } = require("./dbReader");
+const { applyAntigravityIdeVersionOverride } = require("./antigravityIdeVersion");
+const LOCAL_PORT = 443;
+const IS_WIN = process.platform === "win32";
+const ENABLE_FILE_LOG = IS_DEV;
 
-// Allow self-signed certs from MITM root CA when fetching external hosts
-
-
+// Clear stale dump files on every MITM start (prevents unbounded disk usage)
+clearDumpDir();
 const INTERNAL_REQUEST_HEADER = { name: "x-request-source", value: "local" };
 
-// All intercepted domains across all tools
-const TARGET_HOSTS = [
-  "daily-cloudcode-pa.googleapis.com",
-  "cloudcode-pa.googleapis.com",
-  "api.individual.githubcopilot.com",
-];
+// Host rewrite for upstream forward: PROD cloudcode-pa is rate-limited (429),
+// daily-cloudcode-pa (dev endpoint) accepts same body+token. Same trick as open-sse.
+const HOST_REWRITE = {
+  "cloudcode-pa.googleapis.com": "daily-cloudcode-pa.googleapis.com",
+};
 
-const LOCAL_PORT = 443;
-const ROUTER_URL = "http://localhost:20128/v1/chat/completions";
-const API_KEY = process.env.ROUTER_API_KEY;
-const { DATA_DIR, MITM_DIR } = require("./paths");
-const DB_FILE = path.join(DATA_DIR, "db.json");
+const handlers = {
+  antigravity: require("./handlers/antigravity"),
+  copilot: require("./handlers/copilot"),
+  kiro: require("./handlers/kiro"),
+  cursor: require("./handlers/cursor"),
+};
 
-const ENABLE_FILE_LOG = false;
+// ── SSL / SNI ─────────────────────────────────────────────────
 
-if (!API_KEY) {
-  err("ROUTER_API_KEY required");
-  process.exit(1);
-}
-
-const { getCertForDomain } = require("./cert/generate");
-
-// Certificate cache for performance
 const certCache = new Map();
+let rootCAPem;
 
-// SNI callback for dynamic certificate generation
 function sniCallback(servername, cb) {
   try {
-    // Check cache first
-    if (certCache.has(servername)) {
-      const cached = certCache.get(servername);
-      return cb(null, cached);
-    }
-
-    // Generate new cert for this domain
+    if (certCache.has(servername)) return cb(null, certCache.get(servername));
     const certData = getCertForDomain(servername);
-    if (!certData) {
-      return cb(new Error(`Failed to generate cert for ${servername}`));
-    }
-
-    // Create secure context
+    if (!certData) return cb(new Error(`Failed to generate cert for ${servername}`));
     const ctx = require("tls").createSecureContext({
       key: certData.key,
-      cert: certData.cert
+      cert: `${certData.cert}\n${rootCAPem}`
     });
-
-    // Cache it
     certCache.set(servername, ctx);
-    log(`🔐 Cert generated: ${servername}`);
-
     cb(null, ctx);
-  } catch (error) {
-    err(`SNI error for ${servername}: ${error.message}`);
-    cb(error);
+  } catch (e) {
+    err(`SNI error for ${servername}: ${e.message}`);
+    cb(e);
   }
 }
 
-// Load Root CA for default context
-const certDir = MITM_DIR;
-const rootCAKeyPath = path.join(certDir, "rootCA.key");
-const rootCACertPath = path.join(certDir, "rootCA.crt");
-
 let sslOptions;
 try {
-  sslOptions = {
-    key: fs.readFileSync(rootCAKeyPath),
-    cert: fs.readFileSync(rootCACertPath),
-    SNICallback: sniCallback
-  };
+  if (!fs.existsSync(path.join(MITM_DIR, "rootCA.key")) || !fs.existsSync(path.join(MITM_DIR, "rootCA.crt"))) {
+    log("Root CA missing, generating...");
+    generateCert();
+  }
+
+  const rootKey = fs.readFileSync(path.join(MITM_DIR, "rootCA.key"));
+  const rootCert = fs.readFileSync(path.join(MITM_DIR, "rootCA.crt"));
+  rootCAPem = rootCert.toString("utf8");
+  sslOptions = { key: rootKey, cert: rootCert, SNICallback: sniCallback };
 } catch (e) {
-  err(`Root CA not found in ${certDir}: ${e.message}`);
+  err(`Root CA not found: ${e.message}`);
   process.exit(1);
 }
 
-// Antigravity: Gemini generateContent endpoints
-const ANTIGRAVITY_URL_PATTERNS = [":generateContent", ":streamGenerateContent"];
-// Copilot: OpenAI-compatible + Anthropic endpoints
-const COPILOT_URL_PATTERNS = ["/chat/completions", "/v1/messages", "/responses"];
-
-const LOG_DIR = path.join(DATA_DIR, "logs", "mitm");
-if (ENABLE_FILE_LOG && !fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-
-function saveRequestLog(url, bodyBuffer) {
-  if (!ENABLE_FILE_LOG) return;
-  try {
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const urlSlug = url.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 60);
-    const filePath = path.join(LOG_DIR, `${ts}_${urlSlug}.json`);
-    const body = JSON.parse(bodyBuffer.toString());
-    fs.writeFileSync(filePath, JSON.stringify(body, null, 2));
-  } catch { /* ignore */ }
-}
+// ── Helpers ───────────────────────────────────────────────────
 
 const cachedTargetIPs = {};
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
 async function resolveTargetIP(hostname) {
-  if (cachedTargetIPs[hostname]) return cachedTargetIPs[hostname];
+  const cached = cachedTargetIPs[hostname];
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.ip;
   const resolver = new dns.Resolver();
   resolver.setServers(["8.8.8.8"]);
   const resolve4 = promisify(resolver.resolve4.bind(resolver));
   const addresses = await resolve4(hostname);
-  cachedTargetIPs[hostname] = addresses[0];
-  return cachedTargetIPs[hostname];
+  cachedTargetIPs[hostname] = { ip: addresses[0], ts: Date.now() };
+  return cachedTargetIPs[hostname].ip;
 }
 
 function collectBodyRaw(req) {
@@ -123,59 +96,192 @@ function collectBodyRaw(req) {
   });
 }
 
-// Extract model from URL path (Gemini) or body (OpenAI/Anthropic)
-function extractModel(url, body) {
-  const urlMatch = url.match(/\/models\/([^/:]+)/);
-  if (urlMatch) return urlMatch[1];
-  try { return JSON.parse(body.toString()).model || null; } catch { return null; }
-}
-
 function getMappedModel(tool, model) {
   if (!model) return null;
   try {
-    if (!fs.existsSync(DB_FILE)) return null;
-    const db = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
-    const aliases = db.mitmAlias?.[tool];
+    const aliases = getMitmAlias(tool);
     if (!aliases) return null;
-    // Exact match first
-    if (aliases[model]) return aliases[model];
-    // Prefix match fallback: find alias key that starts with model or model starts with key
-    const prefixKey = Object.keys(aliases).find(k => k && aliases[k] && (model.startsWith(k) || k.startsWith(model)));
-    return prefixKey ? aliases[prefixKey] : null;
-  } catch {
+    // Normalize via synonym map (e.g., public AG names -> backend model ids)
+    const normalizedModel = String(model).replace(/^models\//, "");
+    const lookup = MODEL_SYNONYMS?.[tool]?.[normalizedModel] || normalizedModel;
+    if (aliases[lookup]) return aliases[lookup];
+    // Prefix match fallback
+    const prefixKey = Object.keys(aliases).find(k => k && aliases[k] && (lookup.startsWith(k) || k.startsWith(lookup)));
+    if (prefixKey) return aliases[prefixKey];
+    // Pattern fallback: catches AG renamed variants (e.g. deprecated pro IDs → gemini-pro-agent)
+    const patterns = MODEL_PATTERNS?.[tool] || [];
+    for (const { match, alias } of patterns) {
+      if (match.test(lookup) && aliases[alias]) return aliases[alias];
+    }
     return null;
-  }
+  } catch { return null; }
 }
 
 /**
- * Determine which tool this request belongs to based on hostname
+ * Forward request to real upstream.
+ * Optional onResponse(rawBuffer) callback — if provided, tees the response
+ * so it's both forwarded to client AND passed to the callback for inspection.
+ * Also tees full stream into a dump file when ENABLE_FILE_LOG is on.
  */
-function getToolForHost(host) {
-  const h = (host || "").split(":")[0];
-  if (h === "api.individual.githubcopilot.com") return "copilot";
-  if (h === "daily-cloudcode-pa.googleapis.com" || h === "cloudcode-pa.googleapis.com") return "antigravity";
-  return null;
+async function passthrough(req, res, bodyBuffer, onResponse) {
+  const originalHost = (req.headers.host || TARGET_HOSTS[0]).split(":")[0];
+  // Only rewrite host for chat endpoints — daily-cloudcode-pa rejects auth/login requests
+  const isChatEndpoint = req.url.includes(":generateContent") || req.url.includes(":streamGenerateContent");
+  const targetHost = isChatEndpoint ? (HOST_REWRITE[originalHost] || originalHost) : originalHost;
+  const dumper = ENABLE_FILE_LOG ? createResponseDumper(req, "passthrough") : null;
+
+  const tool = getToolForHost(req.headers.host);
+  const versionOverride = tool === "antigravity"
+    ? applyAntigravityIdeVersionOverride(bodyBuffer, req.headers)
+    : { bodyBuffer, headers: req.headers };
+  const bodyForForwarding = versionOverride.bodyBuffer;
+  const headersForForwarding = { ...versionOverride.headers, host: targetHost };
+  if (bodyForForwarding !== bodyBuffer) {
+    headersForForwarding["content-length"] = String(bodyForForwarding.length);
+  }
+
+  // ALPN negotiate: try HTTP/2 first (like browsers/mitmweb), fallback HTTP/1.1
+  try {
+    const proto = await negotiateAlpn(targetHost);
+    if (proto === "h2") {
+      return await passthroughHttp2(req, res, bodyForForwarding, headersForForwarding, targetHost, onResponse, dumper);
+    }
+  } catch (e) {
+    err(`[mitm] ALPN negotiate failed: ${e.message}, fallback to HTTP/1.1`);
+  }
+
+  return passthroughHttps(req, res, bodyForForwarding, headersForForwarding, targetHost, onResponse, dumper);
 }
 
-async function passthrough(req, res, bodyBuffer) {
-  const targetHost = (req.headers.host || TARGET_HOSTS[0]).split(":")[0];
-  const targetIP = await resolveTargetIP(targetHost);
+// ── ALPN negotiation cache ────────────────────────────────────
+const alpnCache = new Map(); // host → "h2" | "http/1.1"
+async function negotiateAlpn(host) {
+  if (alpnCache.has(host)) return alpnCache.get(host);
+  const ip = await resolveTargetIP(host);
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({
+      host: ip, port: 443, servername: host,
+      ALPNProtocols: ["h2", "http/1.1"], rejectUnauthorized: false,
+    }, () => {
+      const proto = socket.alpnProtocol || "http/1.1";
+      alpnCache.set(host, proto);
+      log(`🔗 [mitm] ALPN ${host} → ${proto}`);
+      socket.end();
+      resolve(proto);
+    });
+    socket.once("error", reject);
+    socket.setTimeout(5000, () => { socket.destroy(new Error("ALPN timeout")); });
+  });
+}
 
+// HTTP/2 passthrough using node:http2 native
+async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onResponse, dumper) {
+  const targetIP = await resolveTargetIP(targetHost);
+  // HTTP/2 pseudo-headers required; strip HTTP/1.1-only headers
+  const h2Headers = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lk = k.toLowerCase();
+    if (lk === "host" || lk === "connection" || lk === "keep-alive" ||
+        lk === "transfer-encoding" || lk === "upgrade" || lk === "proxy-connection") continue;
+    h2Headers[lk] = v;
+  }
+  h2Headers[":method"] = req.method;
+  h2Headers[":path"] = req.url;
+  h2Headers[":scheme"] = "https";
+  h2Headers[":authority"] = targetHost;
+
+  return new Promise((resolve) => {
+    const client = http2.connect(`https://${targetHost}`, {
+      createConnection: () => tls.connect({
+        host: targetIP, port: 443, servername: targetHost,
+        ALPNProtocols: ["h2"], rejectUnauthorized: false,
+      }),
+    });
+    client.once("error", (e) => {
+      err(`[mitm] http2 client error: ${e.message}`);
+      if (dumper) { dumper.writeChunk(`\n[ERROR h2] ${e.message}\n`); dumper.end(); }
+      if (!res.headersSent) res.writeHead(502);
+      if (!res.writableEnded) res.end("Bad Gateway");
+      try { client.close(); } catch {}
+      resolve();
+    });
+
+    const stream = client.request(h2Headers, { endStream: bodyBuffer.length === 0 });
+    if (bodyBuffer.length > 0) stream.end(bodyBuffer);
+
+    stream.once("response", (responseHeaders) => {
+      const status = responseHeaders[":status"];
+      // Filter pseudo-headers + connection-specific
+      const outHeaders = {};
+      for (const [k, v] of Object.entries(responseHeaders)) {
+        if (k.startsWith(":")) continue;
+        if (k === "connection" || k === "keep-alive" || k === "transfer-encoding") continue;
+        outHeaders[k] = v;
+      }
+      res.writeHead(status, outHeaders);
+      if (dumper) dumper.writeHeader(status, outHeaders);
+
+      const chunks = [];
+      stream.on("data", chunk => {
+        if (dumper) dumper.writeChunk(chunk);
+        if (onResponse) chunks.push(chunk);
+        res.write(chunk);
+      });
+      stream.on("end", () => {
+        if (dumper) dumper.end();
+        if (!res.writableEnded) res.end();
+        if (onResponse) try { onResponse(Buffer.concat(chunks), outHeaders); } catch {}
+        try { client.close(); } catch {}
+        resolve();
+      });
+    });
+    stream.once("error", (e) => {
+      err(`[mitm] http2 stream error: ${e.message}`);
+      if (dumper) { dumper.writeChunk(`\n[ERROR h2-stream] ${e.message}\n`); dumper.end(); }
+      if (!res.headersSent) res.writeHead(502);
+      if (!res.writableEnded) res.end();
+      try { client.close(); } catch {}
+      resolve();
+    });
+  });
+}
+
+// Fallback: raw https.request HTTP/1.1 with custom DNS (bypasses /etc/hosts MITM loop)
+async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onResponse, dumper) {
+  const targetIP = await resolveTargetIP(targetHost);
   const forwardReq = https.request({
     hostname: targetIP,
     port: 443,
     path: req.url,
     method: req.method,
-    headers: { ...req.headers, host: targetHost },
+    headers,
     servername: targetHost,
     rejectUnauthorized: false
   }, (forwardRes) => {
     res.writeHead(forwardRes.statusCode, forwardRes.headers);
-    forwardRes.pipe(res);
+    if (dumper) dumper.writeHeader(forwardRes.statusCode, forwardRes.headers);
+
+    if (!onResponse && !dumper) {
+      forwardRes.pipe(res);
+      return;
+    }
+
+    const chunks = [];
+    forwardRes.on("data", chunk => {
+      if (dumper) dumper.writeChunk(chunk);
+      if (onResponse) chunks.push(chunk);
+      res.write(chunk);
+    });
+    forwardRes.on("end", () => {
+      if (dumper) dumper.end();
+      res.end();
+      if (onResponse) try { onResponse(Buffer.concat(chunks), forwardRes.headers); } catch { /* ignore */ }
+    });
   });
 
   forwardReq.on("error", (e) => {
     err(`Passthrough error: ${e.message}`);
+    if (dumper) { dumper.writeChunk(`\n[ERROR] ${e.message}\n`); dumper.end(); }
     if (!res.headersSent) res.writeHead(502);
     res.end("Bad Gateway");
   });
@@ -184,53 +290,9 @@ async function passthrough(req, res, bodyBuffer) {
   forwardReq.end();
 }
 
-async function intercept(req, res, bodyBuffer, mappedModel) {
-  try {
-    const body = JSON.parse(bodyBuffer.toString());
-    body.model = mappedModel;
-
-    const response = await fetch(ROUTER_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${API_KEY}`
-      },
-      body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => "");
-      throw new Error(`9Router ${response.status}: ${errText}`);
-    }
-
-    const ct = response.headers.get("content-type") || "application/json";
-    const resHeaders = { "Content-Type": ct, "Cache-Control": "no-cache", "Connection": "keep-alive" };
-    if (ct.includes("text/event-stream")) resHeaders["X-Accel-Buffering"] = "no";
-    res.writeHead(200, resHeaders);
-
-    // Guard: some responses have no body (e.g. errors, empty replies)
-    if (!response.body) {
-      const text = await response.text().catch(() => "");
-      res.end(text);
-      return;
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) { res.end(); break; }
-      res.write(decoder.decode(value, { stream: true }));
-    }
-  } catch (error) {
-    err(`Intercept error: ${error.message}`);
-    if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: error.message, type: "mitm_error" } }));
-  }
-}
+// ── Request handler ───────────────────────────────────────────
 
 const server = https.createServer(sslOptions, async (req, res) => {
-  // Top-level catch to prevent uncaughtException from crashing the server
   try {
     if (req.url === "/_mitm_health") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -239,9 +301,9 @@ const server = https.createServer(sslOptions, async (req, res) => {
     }
 
     const bodyBuffer = await collectBodyRaw(req);
-    if (bodyBuffer.length > 0) saveRequestLog(req.url, bodyBuffer);
+    if (ENABLE_FILE_LOG) dumpRequest(req, bodyBuffer, "raw");
 
-    // Anti-loop: requests originating from 9Router bypass interception
+    // Anti-loop: skip requests from 9Router
     if (req.headers[INTERNAL_REQUEST_HEADER.name] === INTERNAL_REQUEST_HEADER.value) {
       return passthrough(req, res, bodyBuffer);
     }
@@ -249,49 +311,93 @@ const server = https.createServer(sslOptions, async (req, res) => {
     const tool = getToolForHost(req.headers.host);
     if (!tool) return passthrough(req, res, bodyBuffer);
 
-    // Check if this URL should be intercepted based on tool
-    const isChat = tool === "antigravity"
-      ? ANTIGRAVITY_URL_PATTERNS.some(p => req.url.includes(p))
-      : COPILOT_URL_PATTERNS.some(p => req.url.includes(p));
+    // Kiro IDE posts chat to `/` with x-amz-target (not path /generateAssistantResponse)
+    if (!isChatRequest(tool, req)) return passthrough(req, res, bodyBuffer);
 
-    if (!isChat) return passthrough(req, res, bodyBuffer);
+    // Cursor uses binary proto — model extraction not possible at this layer.
+    // Delegate directly to handler which decodes proto internally.
+    if (tool === "cursor") {
+      return handlers[tool].intercept(req, res, bodyBuffer, null, passthrough);
+    }
 
     const model = extractModel(req.url, bodyBuffer);
-    log(`🔍 model="${model}" url=${req.url}`);
-    const mappedModel = getMappedModel(tool, model);
 
-    if (!mappedModel) {
-      log(`⏩ passthrough | no mapping | ${tool} | ${model || "unknown"}`);
+    // Intentional passthrough: some models must never be re-routed (e.g. Antigravity
+    // tab-autocomplete) so latency-critical inline completion stays native. Silent — this
+    // is by design, not a leak, and fires per keystroke. See MODEL_NO_MAP in config.js.
+    if (model && (MODEL_NO_MAP[tool] || []).some((re) => re.test(model))) {
       return passthrough(req, res, bodyBuffer);
     }
 
-    log(`⚡ intercept | ${tool} | ${model} → ${mappedModel}`);
-    return intercept(req, res, bodyBuffer, mappedModel);
+    const mappedModel = getMappedModel(tool, model);
+    if (!mappedModel) {
+      return passthrough(req, res, bodyBuffer);
+    }
+
+    return handlers[tool].intercept(req, res, bodyBuffer, mappedModel, passthrough);
   } catch (e) {
-    err(`Unhandled request error: ${e.message}`);
+    err(`Unhandled error: ${e.message}`);
     if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: e.message, type: "mitm_error" } }));
   }
 });
 
-server.listen(LOCAL_PORT, () => {
-  log(`🚀 Server ready on :${LOCAL_PORT}`);
-});
-
-server.on("error", (error) => {
-  if (error.code === "EADDRINUSE") {
-    err(`Port ${LOCAL_PORT} already in use`);
-  } else if (error.code === "EACCES") {
-    err(`Permission denied for port ${LOCAL_PORT}`);
-  } else {
-    err(error.message);
+// Kill only processes LISTENING on LOCAL_PORT (not outbound connections)
+function killPort(port) {
+  try {
+    let pidList = [];
+    if (IS_WIN) {
+      const psCmd = `powershell -NonInteractive -WindowStyle Hidden -Command ` +
+        `"Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"`;
+      const out = execSync(psCmd, { encoding: "utf-8", windowsHide: true }).trim();
+      if (!out) return;
+      pidList = out.split(/\r?\n/).map(s => s.trim()).filter(p => p && Number(p) !== process.pid && Number(p) > 4);
+    } else {
+      const out = execSync(`${LSOF_BIN} -nP -iTCP:${port} -sTCP:LISTEN -t`, { encoding: "utf-8", windowsHide: true }).trim();
+      if (!out) return;
+      pidList = out.split("\n").filter(p => p && Number(p) !== process.pid);
+    }
+    if (pidList.length === 0) return;
+    pidList.forEach(pid => {
+      try {
+        if (IS_WIN) execSync(`taskkill /F /PID ${pid}`, { windowsHide: true });
+        else process.kill(Number(pid), "SIGKILL");
+      } catch (e) {
+        err(`Failed to kill PID ${pid}: ${e.message}`);
+      }
+    });
+    log(`Killed ${pidList.length} process(es) on port ${port}`);
+  } catch (e) {
+    if (e.status !== 1) throw e;
   }
+}
+
+try {
+  killPort(LOCAL_PORT);
+} catch (e) {
+  err(`Cannot kill process on port ${LOCAL_PORT}: ${e.message}`);
+  process.exit(1);
+}
+
+server.listen(LOCAL_PORT, () => log(`🚀 Server ready on :${LOCAL_PORT}`));
+
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") err(`Port ${LOCAL_PORT} already in use`);
+  else if (e.code === "EACCES") err(`Permission denied for port ${LOCAL_PORT}`);
+  else err(e.message);
   process.exit(1);
 });
 
-const shutdown = () => { server.close(() => process.exit(0)); };
+const { removeAllDNSEntriesSync } = require("./dns/dnsConfig");
+let isShuttingDown = false;
+const shutdown = () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  // Strip tool hosts from /etc/hosts so other apps aren't broken after exit
+  removeAllDNSEntriesSync();
+  const forceExit = setTimeout(() => process.exit(0), 1500);
+  server.close(() => { clearTimeout(forceExit); process.exit(0); });
+};
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
-if (process.platform === "win32") {
-  process.on("SIGBREAK", shutdown);
-}
+if (process.platform === "win32") process.on("SIGBREAK", shutdown);

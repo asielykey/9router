@@ -1,16 +1,112 @@
 import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
-
-const isCloud = typeof caches !== "undefined" && typeof caches === "object";
+import { dbg } from "./debugLog.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
 
+// ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
+// Disabled: not in use. Kept commented for future re-enable.
+// Restore the original block to re-enable per-host JA3 spoofing.
+/*
+let _gotScraping = null;
+let _gotScrapingChecked = false;
+const _gotScrapingLoggedHosts = new Set();
+
+async function getGotScraping() {
+  if (_gotScrapingChecked) return _gotScraping;
+  _gotScrapingChecked = true;
+  try {
+    const mod = await import("got-scraping");
+    _gotScraping = typeof mod.gotScraping === "function" ? mod.gotScraping : null;
+    if (_gotScraping) dbg("TLS", "got-scraping loaded (browser-like JA3 enabled)");
+  } catch (e) {
+    console.warn(`[ProxyFetch] got-scraping unavailable, falling back to native fetch: ${e.message}`);
+    _gotScraping = null;
+  }
+  return _gotScraping;
+}
+
+async function gotScrapingFetch(url, options) {
+  const gs = await getGotScraping();
+  if (!gs) return null;
+
+  const method = (options.method || "GET").toUpperCase();
+  const headersInit = options.headers || {};
+  const headers = headersInit instanceof Headers
+    ? Object.fromEntries(headersInit.entries())
+    : { ...headersInit };
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const stream = gs.stream({
+      url,
+      method,
+      headers,
+      body: method === "GET" || method === "HEAD" ? undefined : options.body,
+      throwHttpErrors: false,
+      retry: { limit: 0 },
+      timeout: { request: undefined },
+      followRedirect: false,
+      decompress: true,
+    });
+
+    if (options.signal) {
+      const onAbort = () => { try { stream.destroy(new Error("aborted")); } catch { } };
+      if (options.signal.aborted) onAbort();
+      else options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    stream.once("response", (res) => {
+      if (settled) return;
+      settled = true;
+      const resHeaders = new Headers();
+      for (const [k, v] of Object.entries(res.headers || {})) {
+        if (Array.isArray(v)) v.forEach((x) => resHeaders.append(k, String(x)));
+        else if (v != null) resHeaders.set(k, String(v));
+      }
+      const body = Readable.toWeb(stream);
+      resolve(new Response(body, { status: res.statusCode, statusText: res.statusMessage || "", headers: resHeaders }));
+    });
+
+    stream.once("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
+
+async function tryGotScrapingFetch(url, options) {
+  try {
+    const res = await gotScrapingFetch(url, options);
+    if (res) {
+      try {
+        const host = new URL(typeof url === "string" ? url : url.toString()).hostname;
+        if (!_gotScrapingLoggedHosts.has(host)) {
+          _gotScrapingLoggedHosts.add(host);
+          dbg("TLS", `using got-scraping for ${host}`);
+        }
+      } catch { }
+    }
+    return res;
+  } catch (e) {
+    console.warn(`[ProxyFetch] got-scraping request failed, fallback to native fetch: ${e.message}`);
+    return null;
+  }
+}
+*/
+
 // DNS cache — use Map to avoid prototype pollution via malformed hostnames
 const DNS_CACHE = new Map();
-const MITM_BYPASS_HOSTS = ["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com", "googleapis.com"];
-const MITM_BYPASS_HEADER = "x-request-source";
-const MITM_BYPASS_VALUE = "local";
+const MITM_BYPASS_HOSTS = [
+  "cloudcode-pa.googleapis.com",
+  "daily-cloudcode-pa.googleapis.com",
+  "api.individual.githubcopilot.com",
+  "q.us-east-1.amazonaws.com",
+  "codewhisperer.us-east-1.amazonaws.com",
+  "api2.cursor.sh",
+];
 const GOOGLE_DNS_SERVERS = ["8.8.8.8", "8.8.4.4"];
 const HTTPS_PORT = 443;
 const HTTP_SUCCESS_MIN = 200;
@@ -46,23 +142,7 @@ async function resolveRealIP(hostname) {
 /**
  * Check if request should bypass MITM DNS redirect
  */
-function shouldBypassMitmDns(url, options) {
-  if (!options?.headers) return false;
-
-  const headers = options.headers;
-  const hasLocalMarker = headers[MITM_BYPASS_HEADER] === MITM_BYPASS_VALUE ||
-                         headers[MITM_BYPASS_HEADER.charAt(0).toUpperCase() + MITM_BYPASS_HEADER.slice(1)] === MITM_BYPASS_VALUE;
-
-  if (!hasLocalMarker) {
-    try {
-      const hostname = new URL(url).hostname;
-      if (MITM_BYPASS_HOSTS.some(host => hostname.includes(host))) {
-        console.warn(`[ProxyFetch] MITM bypass NOT triggered for ${hostname} - missing header`);
-      }
-    } catch { /* invalid URL — skip debug log */ }
-    return false;
-  }
-
+function shouldBypassMitmDns(url) {
   try {
     const hostname = new URL(url).hostname;
     return MITM_BYPASS_HOSTS.some(host => hostname.includes(host));
@@ -96,11 +176,11 @@ function getEnvProxyUrl(targetUrl) {
 
   if (protocol === "https:") {
     return process.env.HTTPS_PROXY || process.env.https_proxy ||
-           process.env.ALL_PROXY || process.env.all_proxy;
+      process.env.ALL_PROXY || process.env.all_proxy;
   }
 
   return process.env.HTTP_PROXY || process.env.http_proxy ||
-         process.env.ALL_PROXY || process.env.all_proxy;
+    process.env.ALL_PROXY || process.env.all_proxy;
 }
 
 /**
@@ -111,7 +191,7 @@ function normalizeProxyUrl(proxyUrl) {
   if (!normalizedInput) return null;
 
   try {
-    // eslint-disable-next-line no-new
+
     new URL(normalizedInput);
     return normalizedInput;
   } catch {
@@ -168,8 +248,13 @@ async function createBypassRequest(parsedUrl, realIP, options) {
     socket.connect(HTTPS_PORT, realIP, () => {
       const reqOptions = {
         socket,
+        // SNI + cert hostname are validated against the hostname the caller
+        // asked for, not the IP we connected to. This keeps the DNS-bypass
+        // (avoiding /etc/hosts MITM) while still rejecting on-path attackers
+        // that present a different cert. The MITM_BYPASS_HOSTS targets are
+        // all public-CA-issued (Google / GitHub / AWS / Cursor) so default
+        // verification works without any extra trust store.
         servername: parsedUrl.hostname,
-        rejectUnauthorized: false,
         path: parsedUrl.pathname + parsedUrl.search,
         method: options.method || "POST",
         headers: {
@@ -209,8 +294,37 @@ async function createBypassRequest(parsedUrl, realIP, options) {
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
 
-  // MITM DNS bypass: resolve real IP for googleapis.com when x-request-source: local
-  if (shouldBypassMitmDns(targetUrl, options)) {
+  // Vercel relay: forward request via relay headers
+  const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
+  if (vercelRelayUrl) {
+    const parsed = new URL(targetUrl);
+    const relayHeaders = {
+      ...options.headers,
+      "x-relay-target": `${parsed.protocol}//${parsed.host}`,
+      "x-relay-path": `${parsed.pathname}${parsed.search}`,
+    };
+    return originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
+  }
+
+  const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
+  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
+  const proxyUrl = connectionProxyUrl || envProxyUrl;
+
+  // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
+  if (shouldBypassMitmDns(targetUrl)) {
+    if (proxyUrl) {
+      // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
+      try {
+        const dispatcher = await getDispatcher(proxyUrl);
+        return await originalFetch(url, { ...options, dispatcher });
+      } catch (proxyError) {
+        if (proxyOptions?.strictProxy === true) {
+          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+        }
+        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${proxyError.message}`);
+      }
+    }
+    // No proxy — manually resolve real IP to bypass DNS spoof
     try {
       const parsedUrl = new URL(targetUrl);
       const realIP = await resolveRealIP(parsedUrl.hostname);
@@ -219,10 +333,6 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       console.warn(`[ProxyFetch] MITM bypass failed: ${error.message}`);
     }
   }
-
-  const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
-  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
-  const proxyUrl = connectionProxyUrl || envProxyUrl;
 
   if (proxyUrl) {
     try {
@@ -238,6 +348,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     }
   }
 
+  // got-scraping disabled — use native fetch directly
+  // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
   return originalFetch(url, options);
 }
 
@@ -249,8 +361,8 @@ async function patchedFetch(url, options = {}) {
 }
 
 // Idempotency guard — only patch once to avoid wrapping multiple times
-if (!isCloud && globalThis.fetch !== patchedFetch) {
+if (globalThis.fetch !== patchedFetch) {
   globalThis.fetch = patchedFetch;
 }
 
-export default isCloud ? originalFetch : patchedFetch;
+export default patchedFetch;

@@ -1,11 +1,21 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings } from "@/lib/localDb";
-import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
+import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
-import { resolveProviderId } from "@/shared/constants/providers.js";
+import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
+
+const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
+
+function githubMonthlyResetMs(status, errorText, provider) {
+  if (resolveProviderId(provider) !== "github" || Number(status) !== 402) return null;
+  if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
+  const now = new Date();
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+}
 
 /**
  * Get provider credentials from localDb
@@ -14,11 +24,12 @@ let selectionMutex = Promise.resolve();
  * @param {Set<string>|string|null} excludeConnectionIds - Connection ID(s) to exclude (for retry with next account)
  * @param {string|null} model - Model name for per-model rate limit filtering
  */
-export async function getProviderCredentials(provider, excludeConnectionIds = null, model = null) {
+export async function getProviderCredentials(provider, excludeConnectionIds = null, model = null, options = {}) {
   // Normalize to Set for consistent handling
   const excludeSet = excludeConnectionIds instanceof Set
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
+  const preferredConnectionId = options?.preferredConnectionId || null;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -29,6 +40,33 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
     const providerId = resolveProviderId(provider);
+
+    // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
+    if (FREE_PROVIDERS[providerId]?.noAuth) {
+      const settings = await getSettings();
+      const override = (settings.providerStrategies || {})[providerId] || {};
+      const strategy = override.rotateStrategy || "none";
+      let pickedId = override.proxyPoolId || null;
+      if (strategy !== "none") {
+        const allPools = await getProxyPools({ isActive: true });
+        const poolIds = allPools.filter(p => p.proxyUrl).map(p => p.id);
+        pickedId = pickProxyPoolId(poolIds, strategy, providerId);
+      }
+      const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
+      return {
+        id: "noauth",
+        connectionName: "Public",
+        isActive: true,
+        accessToken: "public",
+        providerSpecificData: {
+          connectionProxyEnabled: resolvedProxy.connectionProxyEnabled,
+          connectionProxyUrl: resolvedProxy.connectionProxyUrl,
+          connectionNoProxy: resolvedProxy.connectionNoProxy,
+          connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
+          vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
+        },
+      };
+    }
 
     const connections = await getProviderConnections({ provider: providerId, isActive: true });
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
@@ -81,7 +119,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
 
     let connection;
-    if (strategy === "round-robin") {
+    // Pin to preferred connection if specified and available
+    if (preferredConnectionId) {
+      connection = availableConnections.find((c) => c.id === preferredConnectionId);
+      if (connection) {
+        log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
+      }
+    }
+    if (connection) {
+      // skip strategy
+    } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
       // Sort by lastUsed (most recent first) to find current candidate
@@ -128,9 +175,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
     return {
+      authType: connection.authType,
       apiKey: connection.apiKey,
       accessToken: connection.accessToken,
       refreshToken: connection.refreshToken,
+      idToken: connection.idToken,
+      expiresAt: connection.expiresAt,
+      expiresIn: connection.expiresIn,
+      lastRefreshAt: connection.lastRefreshAt,
       projectId: connection.projectId,
       connectionName: connection.displayName || connection.name || connection.email || connection.id,
       copilotToken: connection.providerSpecificData?.copilotToken,
@@ -140,6 +192,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connectionProxyUrl: resolvedProxy.connectionProxyUrl,
         connectionNoProxy: resolvedProxy.connectionNoProxy,
         connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
+        vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
       },
       connectionId: connection.id,
       // Include current status for optimization check
@@ -163,16 +216,32 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string|null} model - The specific model that triggered the error
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+  if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
 
-  const { shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel);
+  // GitHub premium-request exhaustion is account-wide until the next UTC month.
+  const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
+
+  // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
+  let shouldFallback, cooldownMs, newBackoffLevel;
+  if (githubResetAtMs) {
+    shouldFallback = true;
+    cooldownMs = githubResetAtMs - Date.now();
+    newBackoffLevel = 0;
+  } else if (resetsAtMs && resetsAtMs > Date.now()) {
+    shouldFallback = true;
+    cooldownMs = Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
+    newBackoffLevel = 0;
+  } else {
+    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
+  }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(model, cooldownMs);
+  const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
@@ -204,6 +273,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
  * @param {string|null} model - model that succeeded
  */
 export async function clearAccountError(connectionId, currentConnection, model = null) {
+  if (!connectionId || connectionId === "noauth") return;
   const conn = currentConnection._connection || currentConnection;
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
@@ -231,12 +301,16 @@ export async function clearAccountError(connectionId, currentConnection, model =
 
   // Only reset error state if no active locks remain
   if (remainingActiveLocks.length === 0) {
-    Object.assign(clearObj, { testStatus: "active", lastError: null, lastErrorAt: null, backoffLevel: 0 });
+    Object.assign(clearObj, {
+      testStatus: "active",
+      lastError: null,
+      errorCode: null,
+      lastErrorAt: null,
+      backoffLevel: 0
+    });
   }
 
   await updateProviderConnection(connectionId, clearObj);
-  const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
-  log.info("AUTH", `Account ${connName} cleared lock for model=${model || "__all"}`);
 }
 
 /**

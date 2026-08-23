@@ -1,14 +1,35 @@
-const { exec, spawn } = require("child_process");
+const { exec, spawn, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { log, err } = require("../logger");
+const { TOOL_HOSTS } = require("../../shared/constants/mitmToolHosts.js");
+const { runElevatedPowerShell, isAdmin } = require("../winElevated.js");
 
-// Per-tool DNS hosts mapping
-const TOOL_HOSTS = {
-  antigravity: ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"],
-  copilot: ["api.individual.githubcopilot.com"],
-};
+/**
+ * Atomic-ish write for Windows hosts file with rollback on failure.
+ * Strategy: write `.new` sibling → rename current to `.bak` → rename `.new` to target.
+ * If anything fails mid-way, restore from `.bak`. Same-volume renames are atomic on NTFS.
+ */
+function atomicWriteHostsWin(target, originalContent, newContent) {
+  const tmpNew = `${target}.9router.new`;
+  const tmpBak = `${target}.9router.bak`;
+  try {
+    fs.writeFileSync(tmpNew, newContent, "utf8");
+    try { fs.unlinkSync(tmpBak); } catch { /* none */ }
+    fs.renameSync(target, tmpBak);
+    try {
+      fs.renameSync(tmpNew, target);
+    } catch (e) {
+      // Rollback: restore original
+      try { fs.renameSync(tmpBak, target); } catch { fs.writeFileSync(target, originalContent, "utf8"); }
+      throw e;
+    }
+    try { fs.unlinkSync(tmpBak); } catch { /* best effort */ }
+  } finally {
+    try { fs.unlinkSync(tmpNew); } catch { /* already moved or never created */ }
+  }
+}
 
 const IS_WIN = process.platform === "win32";
 const IS_MAC = process.platform === "darwin";
@@ -16,55 +37,41 @@ const HOSTS_FILE = IS_WIN
   ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "drivers", "etc", "hosts")
   : "/etc/hosts";
 
-/**
- * Execute elevated PowerShell script on Windows via Start-Process -Verb RunAs.
- * Only UAC consent dialog appears, no CMD/PS window popup.
- */
-function executeElevatedPowerShell(psScriptPath, timeoutMs = 30000) {
-  const flagFile = path.join(os.tmpdir(), `ps_done_${Date.now()}.flag`);
-  const psSQ = (s) => s.replace(/'/g, "''");
-  
-  let psContent = fs.readFileSync(psScriptPath, "utf8");
-  psContent += `\nSet-Content -Path '${psSQ(flagFile)}' -Value 'done' -Encoding UTF8\n`;
-  fs.writeFileSync(psScriptPath, psContent, "utf8");
+/** True when `sudo` exists (e.g. missing on minimal Docker images like Alpine). */
+function isSudoAvailable() {
+  if (IS_WIN) return false;
+  try {
+    execSync("command -v sudo", { stdio: "ignore", windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  const outerCmd = `Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','${psSQ(psScriptPath)}' -Verb RunAs -WindowStyle Hidden`;
+function canRunSudoWithoutPassword() {
+  if (IS_WIN || !isSudoAvailable()) return true;
+  try {
+    execSync("sudo -n true", { stdio: "ignore", windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const settle = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
-
-    exec(
-      `powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "${outerCmd}"`,
-      { windowsHide: true },
-      () => {}
-    );
-
-    const deadline = Date.now() + timeoutMs;
-    const poll = () => {
-      if (settled) return;
-      if (fs.existsSync(flagFile)) {
-        try { fs.unlinkSync(flagFile); fs.unlinkSync(psScriptPath); } catch { /* ignore */ }
-        return settle(resolve);
-      }
-      if (Date.now() > deadline) {
-        try { fs.unlinkSync(psScriptPath); } catch { /* ignore */ }
-        return settle(reject, new Error("Timed out waiting for UAC confirmation"));
-      }
-      setTimeout(poll, 500);
-    };
-    setTimeout(poll, 300);
-  });
+function isSudoPasswordRequired() {
+  return !IS_WIN && isSudoAvailable() && !canRunSudoWithoutPassword();
 }
 
 /**
- * Execute command with sudo password via stdin (macOS/Linux only)
+ * Execute command with sudo password via stdin (macOS/Linux only).
+ * Without sudo in PATH (containers), runs via sh — same user, no elevation.
  */
 function execWithPassword(command, password) {
   return new Promise((resolve, reject) => {
-    const child = spawn("sudo", ["-S", "sh", "-c", command], {
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    const useSudo = isSudoAvailable();
+    const child = useSudo
+      ? spawn("sudo", ["-S", "sh", "-c", command], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
+      : spawn("sh", ["-c", command], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
 
     let stdout = "";
     let stderr = "";
@@ -76,9 +83,19 @@ function execWithPassword(command, password) {
       else reject(new Error(stderr || `Exit code ${code}`));
     });
 
-    child.stdin.write(`${password}\n`);
-    child.stdin.end();
+    if (useSudo) {
+      child.stdin.write(`${password}\n`);
+      child.stdin.end();
+    }
   });
+}
+
+/**
+ * Trim trailing blank lines/whitespace, ensure file ends with exactly one newline.
+ */
+function normalizeHostsContent(content) {
+  const eol = IS_WIN ? "\r\n" : "\n";
+  return content.replace(/[\r\n\s]+$/g, "") + eol;
 }
 
 /**
@@ -136,49 +153,28 @@ async function addDNSEntry(tool, sudoPassword) {
     return;
   }
 
-  const entries = entriesToAdd.map(h => `127.0.0.1 ${h}`).join("\n");
-
   try {
     if (IS_WIN) {
-      const hostsPath = HOSTS_FILE.replace(/'/g, "''");
-      
-      // Build PowerShell script with proper error handling
-      const scriptLines = [];
-      scriptLines.push(`$ErrorActionPreference = 'Stop'`);
-      scriptLines.push(`$hostsPath = '${hostsPath}'`);
-      scriptLines.push(`try {`);
-      scriptLines.push(`  $hostsContent = Get-Content -Path $hostsPath -Raw -ErrorAction SilentlyContinue`);
-      scriptLines.push(`  if (-not $hostsContent) { $hostsContent = '' }`);
-      
-      for (const host of entriesToAdd) {
-        // Escape special regex chars in hostname
-        const escapedHost = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        scriptLines.push(`  if ($hostsContent -notmatch '${escapedHost}') {`);
-        scriptLines.push(`    Add-Content -Path $hostsPath -Value '127.0.0.1 ${host}' -Encoding UTF8 -ErrorAction Stop`);
-        scriptLines.push(`    Write-Host "Added DNS entry: ${host}"`);
-        scriptLines.push(`  } else {`);
-        scriptLines.push(`    Write-Host "DNS entry already exists: ${host}"`);
-        scriptLines.push(`  }`);
-      }
-      
-      scriptLines.push(`  ipconfig /flushdns | Out-Null`);
-      scriptLines.push(`} catch {`);
-      scriptLines.push(`  Write-Error "Failed to add DNS: $_"`);
-      scriptLines.push(`  exit 1`);
-      scriptLines.push(`}`);
-      
-      const psScript = scriptLines.join("\n");
-      const tmpPs1 = path.join(os.tmpdir(), `mitm_dns_add_${Date.now()}.ps1`);
-      fs.writeFileSync(tmpPs1, psScript, "utf8");
-      
-      await executeElevatedPowerShell(tmpPs1, 30000);
+      // Read → trim → append → atomic write (Node-side, no CLI size limit)
+      const current = fs.readFileSync(HOSTS_FILE, "utf8");
+      const trimmed = current.replace(/[\r\n\s]+$/g, "");
+      const toAppend = entriesToAdd.map(h => `127.0.0.1 ${h}`).join("\r\n");
+      const next = `${trimmed}\r\n${toAppend}\r\n`;
+      atomicWriteHostsWin(HOSTS_FILE, current, next);
+      await runElevatedPowerShell("ipconfig /flushdns | Out-Null");
     } else {
-      await execWithPassword(`echo "${entries}" >> ${HOSTS_FILE}`, sudoPassword);
+      const current = fs.readFileSync(HOSTS_FILE, "utf8");
+      const trimmed = current.replace(/[\r\n\s]+$/g, "");
+      const toAppend = entriesToAdd.map(h => `127.0.0.1 ${h}`).join("\n");
+      const next = `${trimmed}\n${toAppend}\n`;
+      // Use tee via sudo to overwrite atomically — escape single quotes in content
+      const escaped = next.replace(/'/g, "'\\''");
+      await execWithPassword(`printf '%s' '${escaped}' | tee ${HOSTS_FILE} > /dev/null`, sudoPassword);
       await flushDNS(sudoPassword);
     }
     log(`🌐 DNS ${tool}: ✅ added ${entriesToAdd.join(", ")}`);
   } catch (error) {
-    const msg = error.message?.includes("incorrect password") ? "Wrong sudo password" : "Failed to add DNS entry";
+    const msg = error.message?.includes("incorrect password") ? "Wrong sudo password" : `Failed to add DNS entry: ${error.message}`;
     throw new Error(msg);
   }
 }
@@ -198,49 +194,22 @@ async function removeDNSEntry(tool, sudoPassword) {
 
   try {
     if (IS_WIN) {
-      const content = fs.readFileSync(HOSTS_FILE, "utf8");
-      const filtered = content.split(/\r?\n/).filter(l => !entriesToRemove.some(h => l.includes(h))).join("\r\n");
-      const tmpFile = path.join(os.tmpdir(), `hosts_filtered_${Date.now()}.tmp`);
-      fs.writeFileSync(tmpFile, filtered, "utf8");
-      
-      const tmpEsc = tmpFile.replace(/'/g, "''");
-      const hostsEsc = HOSTS_FILE.replace(/'/g, "''");
-      
-      // Build PowerShell script with proper error handling
-      const scriptLines = [];
-      scriptLines.push(`$ErrorActionPreference = 'Stop'`);
-      scriptLines.push(`try {`);
-      scriptLines.push(`  Copy-Item -Path '${tmpEsc}' -Destination '${hostsEsc}' -Force -ErrorAction Stop`);
-      scriptLines.push(`  Write-Host "Hosts file updated successfully"`);
-      scriptLines.push(`  ipconfig /flushdns | Out-Null`);
-      scriptLines.push(`  Write-Host "DNS cache flushed"`);
-      scriptLines.push(`  Remove-Item '${tmpEsc}' -ErrorAction SilentlyContinue`);
-      scriptLines.push(`} catch {`);
-      scriptLines.push(`  Write-Error "Failed to remove DNS: $_"`);
-      scriptLines.push(`  Remove-Item '${tmpEsc}' -ErrorAction SilentlyContinue`);
-      scriptLines.push(`  exit 1`);
-      scriptLines.push(`}`);
-      
-      const psScript = scriptLines.join("\n");
-      const tmpPs1 = path.join(os.tmpdir(), `mitm_dns_remove_${Date.now()}.ps1`);
-      fs.writeFileSync(tmpPs1, psScript, "utf8");
-      
-      await executeElevatedPowerShell(tmpPs1, 30000);
-      
-      // Cleanup temp file if still exists
-      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+      const current = fs.readFileSync(HOSTS_FILE, "utf8");
+      const filtered = current.split(/\r?\n/).filter(l => !entriesToRemove.some(h => l.includes(h))).join("\r\n");
+      const next = filtered.replace(/[\r\n\s]+$/g, "") + "\r\n";
+      atomicWriteHostsWin(HOSTS_FILE, current, next);
+      await runElevatedPowerShell("ipconfig /flushdns | Out-Null");
     } else {
-      for (const host of entriesToRemove) {
-        const sedCmd = IS_MAC
-          ? `sed -i '' '/${host}/d' ${HOSTS_FILE}`
-          : `sed -i '/${host}/d' ${HOSTS_FILE}`;
-        await execWithPassword(sedCmd, sudoPassword);
-      }
+      const current = fs.readFileSync(HOSTS_FILE, "utf8");
+      const filtered = current.split(/\r?\n/).filter(l => !entriesToRemove.some(h => l.includes(h))).join("\n");
+      const next = filtered.replace(/[\r\n\s]+$/g, "") + "\n";
+      const escaped = next.replace(/'/g, "'\\''");
+      await execWithPassword(`printf '%s' '${escaped}' | tee ${HOSTS_FILE} > /dev/null`, sudoPassword);
       await flushDNS(sudoPassword);
     }
     log(`🌐 DNS ${tool}: ✅ removed ${entriesToRemove.join(", ")}`);
   } catch (error) {
-    const msg = error.message?.includes("incorrect password") ? "Wrong sudo password" : "Failed to remove DNS entry";
+    const msg = error.message?.includes("incorrect password") ? "Wrong sudo password" : `Failed to remove DNS entry: ${error.message}`;
     throw new Error(msg);
   }
 }
@@ -258,13 +227,40 @@ async function removeAllDNSEntries(sudoPassword) {
   }
 }
 
+/**
+ * Sync removal of ALL tool DNS entries — for use during process shutdown
+ * when async ops aren't safe. Assumes caller already has root/admin rights.
+ */
+function removeAllDNSEntriesSync() {
+  try {
+    if (!fs.existsSync(HOSTS_FILE)) return;
+    const allHosts = Object.values(TOOL_HOSTS).flat();
+    const content = fs.readFileSync(HOSTS_FILE, "utf8");
+    const eol = IS_WIN ? "\r\n" : "\n";
+    const filtered = content.split(/\r?\n/).filter(l => !allHosts.some(h => l.includes(h))).join(eol);
+    const next = filtered.replace(/[\r\n\s]+$/g, "") + eol;
+    if (next === content) return;
+    fs.writeFileSync(HOSTS_FILE, next, "utf8");
+    if (IS_WIN) {
+      try { execSync("ipconfig /flushdns", { windowsHide: true, stdio: "ignore" }); } catch { /* ignore */ }
+    } else if (IS_MAC) {
+      try { execSync("dscacheutil -flushcache && killall -HUP mDNSResponder", { stdio: "ignore" }); } catch { /* ignore */ }
+    } else {
+      try { execSync("resolvectl flush-caches 2>/dev/null || true", { stdio: "ignore" }); } catch { /* ignore */ }
+    }
+  } catch { /* best effort during shutdown */ }
+}
+
 module.exports = {
   TOOL_HOSTS,
   addDNSEntry,
   removeDNSEntry,
   removeAllDNSEntries,
+  removeAllDNSEntriesSync,
   execWithPassword,
-  executeElevatedPowerShell,
+  isSudoAvailable,
+  canRunSudoWithoutPassword,
+  isSudoPasswordRequired,
   checkDNSEntry,
   checkAllDNSStatus,
 };
