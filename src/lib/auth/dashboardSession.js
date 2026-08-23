@@ -7,6 +7,7 @@ import { DATA_DIR } from "@/lib/dataDir";
 import { getSettings } from "@/lib/localDb";
 
 const DEFAULT_PASSWORD = "123456";
+export const DASHBOARD_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 function loadJwtSecret() {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
@@ -33,7 +34,7 @@ export async function createDashboardAuthToken(claims = {}) {
   return new SignJWT({ authenticated: true, ...claims })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
-    .setExpirationTime("24h")
+    .setExpirationTime(`${DASHBOARD_SESSION_MAX_AGE_SECONDS}s`)
     .sign(SECRET);
 }
 
@@ -59,11 +60,14 @@ export async function getDashboardAuthSession(token) {
 
 export async function setDashboardAuthCookie(cookieStore, request, claims = {}) {
   const token = await createDashboardAuthToken(claims);
+  const expires = new Date(Date.now() + DASHBOARD_SESSION_MAX_AGE_SECONDS * 1000);
   cookieStore.set("auth_token", token, {
     httpOnly: true,
     secure: shouldUseSecureCookie(request),
     sameSite: "lax",
     path: "/",
+    maxAge: DASHBOARD_SESSION_MAX_AGE_SECONDS,
+    expires,
   });
 }
 

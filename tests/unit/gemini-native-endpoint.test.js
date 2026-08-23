@@ -7,6 +7,10 @@ const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
   markAccountUnavailable: vi.fn(),
   clearAccountError: vi.fn(),
+  executeNativeGemini: vi.fn(),
+  checkAndRefreshToken: vi.fn(),
+  updateProviderCredentials: vi.fn(),
+  getProjectIdForConnection: vi.fn(),
 }));
 
 vi.mock("@/sse/handlers/chat.js", () => ({
@@ -22,6 +26,19 @@ vi.mock("@/sse/services/auth.js", () => ({
 
 vi.mock("@/lib/localDb", () => ({
   getSettings: mocks.getSettings,
+}));
+
+vi.mock("open-sse/executors/index.js", () => ({
+  getExecutor: () => ({ executeNativeGemini: mocks.executeNativeGemini }),
+}));
+
+vi.mock("@/sse/services/tokenRefresh.js", () => ({
+  checkAndRefreshToken: mocks.checkAndRefreshToken,
+  updateProviderCredentials: mocks.updateProviderCredentials,
+}));
+
+vi.mock("open-sse/services/projectId.js", () => ({
+  getProjectIdForConnection: mocks.getProjectIdForConnection,
 }));
 
 const { GET } = await import("../../src/app/api/v1beta/models/route.js");
@@ -68,6 +85,13 @@ describe("Gemini native v1beta endpoint", () => {
       providerSpecificData: {},
     });
     mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: false });
+    mocks.checkAndRefreshToken.mockImplementation(async (_provider, credentials) => credentials);
+    mocks.executeNativeGemini.mockResolvedValue({
+      response: new Response("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"native\"}]}}]}}\r\n\r\n", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    });
     global.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }), {
         status: 200,
@@ -247,6 +271,76 @@ describe("Gemini native v1beta endpoint", () => {
 
     expect(mocks.handleChat).toHaveBeenCalledTimes(1);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("routes header-enabled Gemini streaming through the Antigravity native executor", async () => {
+    const body = {
+      contents: [{ role: "user", parts: [{ text: "hello" }] }],
+      tools: [{ functionDeclarations: [{ name: "read_file", parameters: { type: "OBJECT" } }] }],
+    };
+
+    const response = await POST(
+      makeGeminiRequest(
+        "gemini-3.7-flash-high:streamGenerateContent",
+        body,
+        { "X-9Router-Native-Passthrough": "true" }
+      ),
+      { params: Promise.resolve({ path: ["gemini-3.7-flash-high:streamGenerateContent"] }) }
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('"text":"native"');
+    expect(mocks.handleChat).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "antigravity",
+      expect.any(Set),
+      "gemini-3.7-flash-high"
+    );
+    expect(mocks.executeNativeGemini).toHaveBeenCalledWith(expect.objectContaining({
+      model: "gemini-3.7-flash-high",
+      body,
+      stream: true,
+      signal: expect.any(AbortSignal),
+    }));
+  });
+
+  it("removes only the Antigravity envelope and preserves the Gemini payload", async () => {
+    const geminiPayload = { candidates: [{ content: { parts: [{ functionCall: { name: "read_file", args: { path: "a.js" } }, thoughtSignature: "sig" }] } }], usageMetadata: { totalTokenCount: 42 } };
+    const rawSse = `data: ${JSON.stringify({ response: geminiPayload })}\r\n\r\n`;
+    mocks.executeNativeGemini.mockResolvedValueOnce({
+      response: new Response(rawSse, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+      }),
+    });
+
+    const response = await POST(
+      makeGeminiRequest(
+        "antigravity/gemini-3.7-flash-high:streamGenerateContent",
+        { contents: [{ role: "user", parts: [{ text: "use a tool" }] }] },
+        { "X-9Router-Native-Passthrough": " TRUE " }
+      ),
+      { params: Promise.resolve({ path: ["antigravity", "gemini-3.7-flash-high:streamGenerateContent"] }) }
+    );
+
+    expect(response.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    expect(await response.text()).toBe(`data: ${JSON.stringify(geminiPayload)}\r\n\r\n`);
+    expect(mocks.handleChat).not.toHaveBeenCalled();
+  });
+
+  it("keeps the translated path when native passthrough is disabled", async () => {
+    await POST(
+      makeGeminiRequest(
+        "gemini-3.7-flash-high:streamGenerateContent",
+        { contents: [{ parts: [{ text: "hello" }] }] },
+        { "X-9Router-Native-Passthrough": "false" }
+      ),
+      { params: Promise.resolve({ path: ["gemini-3.7-flash-high:streamGenerateContent"] }) }
+    );
+
+    expect(mocks.handleChat).toHaveBeenCalledTimes(1);
+    expect(mocks.executeNativeGemini).not.toHaveBeenCalled();
   });
 
   it("does not hijack provider-prefixed non-Gemini audio requests", async () => {

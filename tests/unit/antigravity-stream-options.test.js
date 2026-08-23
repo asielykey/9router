@@ -42,4 +42,32 @@ describe("AntigravityExecutor stream_options normalization", () => {
     expect(output.stream).toBe(true);
     expect(output.stream_options).toEqual({ include_usage: true });
   });
+
+  it("wraps a native Gemini request without translating its Gemini fields", async () => {
+    const executor = new AntigravityExecutor();
+    const nativeBody = {
+      contents: [{ role: "user", parts: [{ text: "hello" }] }],
+      systemInstruction: { parts: [{ text: "Keep native Gemini JSON" }] },
+      tools: [{ functionDeclarations: [{ name: "read_file", parameters: { type: "OBJECT" } }] }],
+      generationConfig: { temperature: 0.2, thinkingConfig: { thinkingBudget: 1024 } },
+    };
+    let captured;
+    executor.execute = async (options) => {
+      captured = options;
+      return { response: new Response("") };
+    };
+
+    await executor.executeNativeGemini({
+      model: "gemini-3.7-flash-high",
+      body: nativeBody,
+      stream: true,
+      credentials,
+      signal: new AbortController().signal,
+    });
+
+    expect(captured.body).toEqual({ request: nativeBody });
+    expect(captured.body.request).not.toBe(nativeBody);
+    expect(captured.stream).toBe(true);
+    expect(captured.model).toBe("gemini-3.7-flash-high");
+  });
 });

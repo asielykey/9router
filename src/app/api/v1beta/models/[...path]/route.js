@@ -8,12 +8,17 @@ import {
 import { getSettings } from "@/lib/localDb";
 import { PROVIDER_MODELS } from "@/shared/constants/models";
 import { GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS } from "open-sse/config/runtimeConfig.js";
+import { getExecutor } from "open-sse/executors/index.js";
+import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { initTranslators } from "open-sse/translator/index.js";
+import { checkAndRefreshToken, updateProviderCredentials } from "@/sse/services/tokenRefresh.js";
 
 let initialized = false;
 const GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 // Gemini model id charset (matches sanitizeGeminiFunctionName); blocks path traversal in upstream URL.
 const GEMINI_NATIVE_MODEL_PATTERN = /^[a-zA-Z0-9_.:-]+$/;
+const GEMINI_NATIVE_PASSTHROUGH_HEADER = "x-9router-native-passthrough";
+const GEMINI_NATIVE_OAUTH_PROVIDERS = new Set(["antigravity"]);
 
 /**
  * Initialize translators once
@@ -58,11 +63,13 @@ export async function POST(request, { params }) {
     // path = ["provider", "model:action"] or ["model:action"]
 
     let model;
+    let requestedProvider = null;
     let action; // ":generateContent" | ":streamGenerateContent"
 
     if (path.length >= 2) {
       // Format: /v1beta/models/provider/model:generateContent
       const provider = path[0];
+      requestedProvider = provider;
       const modelAction = path[1];
       action = modelAction.includes(":streamGenerateContent")
         ? ":streamGenerateContent"
@@ -83,6 +90,22 @@ export async function POST(request, { params }) {
     }
 
     const body = await request.json();
+
+    const nativePassthrough = request.headers
+      .get(GEMINI_NATIVE_PASSTHROUGH_HEADER)
+      ?.trim()
+      .toLowerCase() === "true";
+
+    // A standard Gemini model path has no provider prefix. Native passthrough
+    // defaults to Antigravity because this mode is intended for OAuth accounts.
+    const nativeProvider = requestedProvider || "antigravity";
+    if (nativePassthrough && GEMINI_NATIVE_OAUTH_PROVIDERS.has(nativeProvider)) {
+      return await executeNativeGemini(request, body, {
+        provider: nativeProvider,
+        model: requestedProvider ? model.slice(model.indexOf("/") + 1) : model,
+        action,
+      });
+    }
 
     if (isGeminiNativeTtsRequest(model, body)) {
       return await forwardGeminiNativeRequest(request, body, model, action);
@@ -120,6 +143,179 @@ export async function POST(request, { params }) {
       { error: { message: error.message, code: 500 } },
       { status: 500 }
     );
+  }
+}
+
+async function executeNativeGemini(request, body, { provider, model, action }) {
+  const authError = await validateGeminiNativeClientKey(request);
+  if (authError) return authError;
+
+  const modelId = normalizeGeminiNativeModel(model);
+  if (!GEMINI_NATIVE_MODEL_PATTERN.test(modelId)) {
+    return Response.json({ error: { message: "Invalid model" } }, { status: 400 });
+  }
+
+  const executor = getExecutor(provider);
+  if (typeof executor?.executeNativeGemini !== "function") {
+    return Response.json(
+      { error: { message: "Native Gemini passthrough is unavailable for this provider" } },
+      { status: 400 }
+    );
+  }
+
+  const stream = action === ":streamGenerateContent";
+  const excludeConnectionIds = new Set();
+  let lastError = null;
+  let lastStatus = null;
+
+  while (true) {
+    const selectedCredentials = await getProviderCredentials(
+      provider,
+      excludeConnectionIds,
+      modelId
+    );
+    if (!selectedCredentials || selectedCredentials.allRateLimited) {
+      return Response.json(
+        {
+          error: {
+            message: lastError
+              || selectedCredentials?.lastError
+              || `No active credentials for provider: ${provider}`,
+          },
+        },
+        { status: lastStatus || Number(selectedCredentials?.lastErrorCode) || 503 }
+      );
+    }
+
+    const credentials = await checkAndRefreshToken(provider, selectedCredentials);
+    if (!credentials.projectId && credentials.accessToken) {
+      const projectId = await getProjectIdForConnection(
+        selectedCredentials.connectionId,
+        credentials.accessToken,
+        provider
+      );
+      if (projectId) {
+        credentials.projectId = projectId;
+        await updateProviderCredentials(selectedCredentials.connectionId, { projectId });
+      }
+    }
+
+    try {
+      const result = await executor.executeNativeGemini({
+        model: modelId,
+        body,
+        stream,
+        credentials,
+        signal: request.signal,
+        log: console,
+      });
+      const upstreamResponse = result.response;
+
+      if (upstreamResponse.ok) {
+        await clearAccountError(selectedCredentials.connectionId, selectedCredentials, modelId);
+        const responseBody = stream
+          ? unwrapAntigravityGeminiSse(upstreamResponse.body)
+          : await unwrapAntigravityGeminiJson(upstreamResponse);
+        return new Response(responseBody, {
+          status: upstreamResponse.status,
+          statusText: upstreamResponse.statusText,
+          headers: corsHeadersFrom(upstreamResponse),
+        });
+      }
+
+      const errorText = await upstreamResponse.text();
+      const { shouldFallback } = await markAccountUnavailable(
+        selectedCredentials.connectionId,
+        upstreamResponse.status,
+        errorText,
+        provider,
+        modelId
+      );
+      if (shouldFallback) {
+        excludeConnectionIds.add(selectedCredentials.connectionId);
+        lastError = errorText;
+        lastStatus = upstreamResponse.status;
+        continue;
+      }
+
+      return new Response(errorText, {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: corsHeadersFrom(upstreamResponse),
+      });
+    } catch (error) {
+      if (request.signal?.aborted) {
+        return Response.json({ error: { message: "Client closed request" } }, { status: 499 });
+      }
+
+      const errorText = getSafeGeminiNativeErrorText(error);
+      const { shouldFallback } = await markAccountUnavailable(
+        selectedCredentials.connectionId,
+        502,
+        errorText,
+        provider,
+        modelId
+      );
+      if (shouldFallback) {
+        excludeConnectionIds.add(selectedCredentials.connectionId);
+        lastError = errorText;
+        lastStatus = 502;
+        continue;
+      }
+
+      return Response.json({ error: { message: errorText } }, { status: 502 });
+    }
+  }
+}
+
+function unwrapAntigravityGeminiSse(body) {
+  if (!body) return body;
+
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+
+  const transform = new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() || "";
+      for (const frame of frames) {
+        controller.enqueue(encoder.encode(unwrapAntigravityGeminiFrame(frame)));
+      }
+    },
+    flush(controller) {
+      buffer += decoder.decode();
+      if (buffer) controller.enqueue(encoder.encode(unwrapAntigravityGeminiFrame(buffer)));
+    },
+  });
+
+  return body.pipeThrough(transform);
+}
+
+function unwrapAntigravityGeminiFrame(frame) {
+  const lines = frame.split(/\r?\n/);
+  const output = lines.map((line) => {
+    if (!line.startsWith("data:")) return line;
+    const raw = line.slice(5).trimStart();
+    if (!raw) return line;
+    try {
+      const parsed = JSON.parse(raw);
+      return `data: ${JSON.stringify(parsed?.response ?? parsed)}`;
+    } catch {
+      return line;
+    }
+  });
+  return `${output.join("\r\n")}\r\n\r\n`;
+}
+
+async function unwrapAntigravityGeminiJson(response) {
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text);
+    return JSON.stringify(parsed?.response ?? parsed);
+  } catch {
+    return text;
   }
 }
 

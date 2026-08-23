@@ -54,6 +54,18 @@ function parsePositiveInt(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export function parseProviderSelection(searchParams) {
+  const multiple = searchParams
+    .get("providers")
+    ?.split(",")
+    .map((provider) => provider.trim())
+    .filter(Boolean);
+  if (multiple?.length) return new Set(multiple);
+
+  const provider = searchParams.get("provider");
+  return provider && provider !== "all" ? new Set([provider]) : null;
+}
+
 function sortConnections(connections, sort) {
   const list = [...connections];
 
@@ -79,7 +91,7 @@ export async function GET(request) {
     await backfillCodexEmails();
 
     const { searchParams } = new URL(request.url);
-    const provider = searchParams.get("provider") || "all";
+    const selectedProviders = parseProviderSelection(searchParams);
     const accountStatus = searchParams.get("accountStatus") || "all";
     const sort = searchParams.get("sort") || "priority";
     const page = parsePositiveInt(searchParams.get("page"), 1);
@@ -90,7 +102,7 @@ export async function GET(request) {
     const providerOptions = Array.from(new Set(eligibleConnections.map((conn) => conn.provider))).sort();
 
     const providerFilteredConnections = eligibleConnections.filter((conn) => (
-      provider === "all" || conn.provider === provider
+      !selectedProviders || selectedProviders.has(conn.provider)
     ));
 
     const accountFilteredConnections = providerFilteredConnections.filter((conn) => {

@@ -133,6 +133,23 @@ export class AntigravityExecutor extends BaseExecutor {
     };
   }
 
+  /**
+   * Execute a Gemini-native request through the Antigravity OAuth transport.
+   * This bypasses the shared chat translator; only the provider's required
+   * v1internal envelope is added before dispatch.
+   */
+  executeNativeGemini({ model, body, stream = true, credentials, signal, log, proxyOptions = null }) {
+    return this.execute({
+      model,
+      body: { request: structuredClone(body) },
+      stream,
+      credentials,
+      signal,
+      log,
+      proxyOptions,
+    });
+  }
+
   transformRequest(model, body, stream, credentials) {
     const projectId = credentials?.projectId || this.generateProjectId();
 

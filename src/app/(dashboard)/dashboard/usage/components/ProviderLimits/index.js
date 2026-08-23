@@ -24,6 +24,7 @@ import {
   shouldResetPage,
   getPaginationPageValue,
   getProviderOptions,
+  normalizeStoredProviderSelection,
   reconcileConnectionsPage,
   getQuotaCache,
   setQuotaCache,
@@ -32,6 +33,7 @@ import {
   CLAUDE_REFRESH_INTERVAL_MS,
   DEPLETED_QUOTA_THRESHOLD,
   AUTO_REFRESH_STORAGE_KEY,
+  PROVIDER_FILTER_STORAGE_KEY,
   CONNECTIONS_PAGE_SIZE,
   ACCOUNT_PAGE_SIZE_OPTIONS,
   ACCOUNT_PAGE_SIZE_MAX,
@@ -145,7 +147,7 @@ export default function ProviderLimits() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [proxyPools, setProxyPools] = useState([]);
-  const [providerFilter, setProviderFilter] = useState("all");
+  const [selectedProviders, setSelectedProviders] = useState(null);
   const [providerOptions, setProviderOptions] = useState([]);
   const [accountFilter, setAccountFilter] = useState("all");
   const [quotaSortMode, setQuotaSortMode] = useState("default");
@@ -172,6 +174,7 @@ export default function ProviderLimits() {
   const intervalRef = useRef(null);
   const countdownRef = useRef(null);
   const tickCountRef = useRef(0);
+  const providerSelectionHydratedRef = useRef(false);
 
   const fetchConnections = useCallback(
     async (targetPage = page) => {
@@ -183,8 +186,8 @@ export default function ProviderLimits() {
           sort: "priority",
         });
 
-        if (providerFilter !== "all") {
-          params.set("provider", providerFilter);
+        if (selectedProviders !== null) {
+          params.set("providers", selectedProviders.join(","));
         }
 
         const response = await fetch(
@@ -198,7 +201,17 @@ export default function ProviderLimits() {
         const nextTotals = getSafeTotals(data.totals, connectionList.length);
 
         setConnections(connectionList);
-        setProviderOptions(getProviderOptions(data.providerOptions));
+        const nextProviderOptions = getProviderOptions(data.providerOptions);
+        setProviderOptions(nextProviderOptions);
+        if (!providerSelectionHydratedRef.current) {
+          providerSelectionHydratedRef.current = true;
+          try {
+            const stored = JSON.parse(window.localStorage.getItem(PROVIDER_FILTER_STORAGE_KEY));
+            setSelectedProviders(normalizeStoredProviderSelection(stored, nextProviderOptions));
+          } catch {
+            setSelectedProviders(null);
+          }
+        }
         setPagination(nextPagination);
         setTotals(nextTotals);
         setPage(getPaginationPageValue(data.pagination, targetPage));
@@ -212,8 +225,17 @@ export default function ProviderLimits() {
         return [];
       }
     },
-    [accountFilter, expiringFirst, page, pageSize, providerFilter],
+    [accountFilter, page, pageSize, selectedProviders],
   );
+
+  useEffect(() => {
+    if (!providerSelectionHydratedRef.current) return;
+    if (selectedProviders === null) {
+      window.localStorage.removeItem(PROVIDER_FILTER_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(PROVIDER_FILTER_STORAGE_KEY, JSON.stringify(selectedProviders));
+    }
+  }, [selectedProviders]);
 
   // Fetch quota for a specific connection
   const fetchQuota = useCallback(async (connectionId, provider, { force = false } = {}) => {
@@ -690,10 +712,10 @@ export default function ProviderLimits() {
         connections,
         quotaData,
         expiringFirst,
-        providerFilter,
+        selectedProviders?.length === 1 ? selectedProviders[0] : "all",
         quotaSortMode,
       ),
-    [connections, quotaData, expiringFirst, providerFilter, quotaSortMode],
+    [connections, quotaData, expiringFirst, selectedProviders, quotaSortMode],
   );
 
   // Connection is depleted when any quota entry hit the threshold
@@ -744,8 +766,18 @@ export default function ProviderLimits() {
     bulkSetActive(ids, true);
   };
 
-  const selectedProviderLabel =
-    providerFilter === "all" ? "All providers" : providerFilter;
+  const providerFilter = selectedProviders === null
+    ? "all"
+    : selectedProviders.length === 1
+      ? selectedProviders[0]
+      : "multiple";
+  const selectedProviderLabel = selectedProviders === null
+    ? "All providers"
+    : selectedProviders.length === 0
+      ? "No providers"
+      : selectedProviders.length === 1
+        ? selectedProviders[0]
+        : `${selectedProviders.length} providers`;
   const hasEligibleConnections = totals.eligibleConnections > 0;
   const hasVisibleConnections = sortedConnections.length > 0;
   const emptyState = getConnectionsEmptyMessage(
@@ -809,7 +841,7 @@ export default function ProviderLimits() {
               title="Filter quota providers"
             >
               <span className="flex min-w-0 items-center gap-1.5">
-                {providerFilter === "all" ? (
+                {selectedProviders === null || selectedProviders.length !== 1 ? (
                   <span className="material-symbols-outlined text-[14px] text-text-muted">
                     apps
                   </span>
@@ -822,7 +854,7 @@ export default function ProviderLimits() {
                     fallbackText={providerFilter.slice(0, 2).toUpperCase()}
                   />
                 )}
-                <span className="truncate capitalize hidden lg:inline">
+                <span className="max-w-32 truncate capitalize">
                   {selectedProviderLabel}
                 </span>
               </span>
@@ -843,19 +875,16 @@ export default function ProviderLimits() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (shouldResetPage(providerFilter, "all")) {
-                        setPage(1);
-                      }
-                      setProviderFilter("all");
-                      setProviderMenuOpen(false);
+                      setPage(1);
+                      setSelectedProviders(null);
                     }}
-                    className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${providerFilter === "all" ? "bg-primary/10 text-primary" : "text-text-primary hover:bg-black/5 dark:hover:bg-white/10"}`}
+                    className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${selectedProviders === null ? "bg-primary/10 text-primary" : "text-text-primary hover:bg-black/5 dark:hover:bg-white/10"}`}
                   >
                     <span className="material-symbols-outlined text-[22px]">
                       apps
                     </span>
                     <span className="font-medium">All providers</span>
-                    {providerFilter === "all" && (
+                    {selectedProviders === null && (
                       <span className="material-symbols-outlined ml-auto text-[20px]">
                         check
                       </span>
@@ -868,13 +897,16 @@ export default function ProviderLimits() {
                         key={provider}
                         type="button"
                         onClick={() => {
-                          if (shouldResetPage(providerFilter, provider)) {
-                            setPage(1);
-                          }
-                          setProviderFilter(provider);
-                          setProviderMenuOpen(false);
+                          setPage(1);
+                          setSelectedProviders((current) => {
+                            const selected = new Set(current ?? providerOptions);
+                            if (selected.has(provider) && selected.size > 1) selected.delete(provider);
+                            else selected.add(provider);
+                            const next = providerOptions.filter((item) => selected.has(item));
+                            return next.length === providerOptions.length ? null : next;
+                          });
                         }}
-                        className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${providerFilter === provider ? "bg-primary/10 text-primary" : "text-text-primary hover:bg-black/5 dark:hover:bg-white/10"}`}
+                        className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${(selectedProviders === null || selectedProviders.includes(provider)) ? "bg-primary/10 text-primary" : "text-text-primary hover:bg-black/5 dark:hover:bg-white/10"}`}
                       >
                         <ProviderIcon
                           src={`/providers/${provider}.png`}
@@ -886,7 +918,7 @@ export default function ProviderLimits() {
                         <span className="font-medium capitalize">
                           {provider}
                         </span>
-                        {providerFilter === provider && (
+                        {(selectedProviders === null || selectedProviders.includes(provider)) && (
                           <span className="material-symbols-outlined ml-auto text-[20px]">
                             check
                           </span>
