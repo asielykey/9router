@@ -86,21 +86,46 @@ function RecentRequests({ requests = [] }) {
   );
 }
 
-function sortData(dataMap, pendingMap = {}, sortBy, sortOrder) {
+function resolvePricing(pricing, provider, model) {
+  if (!pricing || !model) return null;
+  const candidates = [model, model.includes('/') ? model.split('/').pop() : model];
+  for (const candidate of candidates) {
+    if (provider && pricing[provider]?.[candidate]) return pricing[provider][candidate];
+    for (const models of Object.values(pricing)) {
+      if (models?.[candidate]) return models[candidate];
+    }
+  }
+  return null;
+}
+
+function calculateDisplayBreakdown(data, pricing) {
+  const promptTokens = data.promptTokens || 0;
+  const cachedTokens = data.cachedTokens || 0;
+  const cacheCreationTokens = data.cacheCreationTokens || 0;
+  const completionTokens = data.completionTokens || 0;
+  const reasoningTokens = data.reasoningTokens || 0;
+  const rates = resolvePricing(pricing, data.provider, data.rawModel);
+  if (!rates) return { inputCost: undefined, cachedCost: undefined, outputCost: undefined };
+  const nonCachedInput = Math.max(0, promptTokens - cachedTokens - cacheCreationTokens);
+  const inputCost = nonCachedInput * (Number(rates.input) || 0) / 1_000_000;
+  const cachedReadCost = cachedTokens * (Number(rates.cached ?? rates.input) || 0) / 1_000_000;
+  const cacheCreationCost = cacheCreationTokens * (Number(rates.cache_creation ?? rates.input) || 0) / 1_000_000;
+  const cachedCost = cachedReadCost + cacheCreationCost;
+  const ratedOutputCost = completionTokens * (Number(rates.output) || 0) / 1_000_000
+    + reasoningTokens * (Number(rates.reasoning ?? rates.output) || 0) / 1_000_000;
+  // The persisted total remains authoritative for legacy rows whose aggregate
+  // stats do not expose cache-creation/reasoning counters separately.
+  const outputCost = Math.max(ratedOutputCost, (data.cost || 0) - inputCost - cachedCost);
+  return { inputCost, cachedCost, outputCost };
+}
+
+function sortData(dataMap, pendingMap = {}, sortBy, sortOrder, pricing = null) {
   return Object.entries(dataMap || {})
     .map(([key, data]) => {
       const totalTokens = (data.promptTokens || 0) + (data.completionTokens || 0);
       const totalCost = data.cost || 0;
-      // ponytail: cost split is a token-share allocation of the (rate-accurate)
-      // server total, not a per-rate recompute. cached is a subset of prompt, so
-      // peel it out of the input share. Upgrade to a stored per-component cost
-      // breakdown if exact cached-rate cost display is needed.
-      const cachedTokens = data.cachedTokens || 0;
-      const nonCachedInput = Math.max(0, (data.promptTokens || 0) - cachedTokens);
-      const inputCost = totalTokens > 0 ? nonCachedInput * (totalCost / totalTokens) : 0;
-      const cachedCost = totalTokens > 0 ? cachedTokens * (totalCost / totalTokens) : 0;
-      const outputCost = totalTokens > 0 ? (data.completionTokens || 0) * (totalCost / totalTokens) : 0;
-      return { ...data, key, totalTokens, totalCost, inputCost, cachedCost, outputCost, pending: pendingMap[key] || 0 };
+      const breakdown = calculateDisplayBreakdown(data, pricing);
+      return { ...data, key, totalTokens, totalCost, ...breakdown, pending: pendingMap[key] || 0 };
     })
     .sort((a, b) => {
       let valA = a[sortBy];
@@ -112,7 +137,6 @@ function sortData(dataMap, pendingMap = {}, sortBy, sortOrder) {
       return 0;
     });
 }
-
 function getGroupKey(item, keyField) {
   switch (keyField) {
     case "rawModel": return item.rawModel || "Unknown Model";
@@ -213,11 +237,19 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
   const [tableView, setTableView] = useState("model");
   const [viewMode, setViewMode] = useState("costs");
   const [providers, setProviders] = useState([]);
+  const [pricing, setPricing] = useState(null);
   const [periodLocal, setPeriodLocal] = useState("today");
   const isInitialLoad = useRef(true);
   const hasLoadedStats = useRef(false);
   const period = periodProp ?? periodLocal;
   const setPeriod = setPeriodProp ?? setPeriodLocal;
+
+  useEffect(() => {
+    fetch('/api/pricing')
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => setPricing(data))
+      .catch(() => setPricing(null));
+  }, []);
 
   // Fetch connected providers once, deduplicate by provider type
   // Always include noAuth free providers (e.g. opencode) regardless of connections
@@ -324,7 +356,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
         const pendingMap = stats.pending?.byModel || {};
         return {
           columns: MODEL_COLUMNS,
-          groupedData: groupDataByKey(sortData(stats.byModel, pendingMap, sortBy, sortOrder), "rawModel"),
+          groupedData: groupDataByKey(sortData(stats.byModel, pendingMap, sortBy, sortOrder, pricing), "rawModel"),
           storageKey: "usage-stats:expanded-models",
           emptyMessage: "No usage recorded yet.",
           renderSummaryCells: (group) => (
@@ -357,7 +389,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
         }
         return {
           columns: ACCOUNT_COLUMNS,
-          groupedData: groupDataByKey(sortData(stats.byAccount, pendingMap, sortBy, sortOrder), "accountName"),
+          groupedData: groupDataByKey(sortData(stats.byAccount, pendingMap, sortBy, sortOrder, pricing), "accountName"),
           storageKey: "usage-stats:expanded-accounts",
           emptyMessage: "No account-specific usage recorded yet.",
           renderSummaryCells: (group) => (
@@ -382,7 +414,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       case "apiKey": {
         return {
           columns: API_KEY_COLUMNS,
-          groupedData: groupDataByKey(sortData(stats.byApiKey, {}, sortBy, sortOrder), "keyName"),
+          groupedData: groupDataByKey(sortData(stats.byApiKey, {}, sortBy, sortOrder, pricing), "keyName"),
           storageKey: "usage-stats:expanded-apikeys",
           emptyMessage: "No API key usage recorded yet.",
           renderSummaryCells: (group) => (
@@ -408,7 +440,7 @@ export default function UsageStats({ period: periodProp, setPeriod: setPeriodPro
       default: {
         return {
           columns: ENDPOINT_COLUMNS,
-          groupedData: groupDataByKey(sortData(stats.byEndpoint, {}, sortBy, sortOrder), "endpoint"),
+          groupedData: groupDataByKey(sortData(stats.byEndpoint, {}, sortBy, sortOrder, pricing), "endpoint"),
           storageKey: "usage-stats:expanded-endpoints",
           emptyMessage: "No endpoint usage recorded yet.",
           renderSummaryCells: (group) => (
